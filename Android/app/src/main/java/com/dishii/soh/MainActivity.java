@@ -171,8 +171,17 @@ public class MainActivity extends SDLActivity{
 
     private void writeSupportFilesMarker(File targetRootFolder) throws IOException {
         File markerFile = getSupportFilesMarkerFile(targetRootFolder);
-        try (OutputStream out = new FileOutputStream(markerFile)) {
+        File tempFile = new File(targetRootFolder, SUPPORT_FILES_VERSION_MARKER + ".tmp");
+        try (FileOutputStream out = new FileOutputStream(tempFile)) {
             out.write(SUPPORT_FILES_VERSION.getBytes());
+            out.getFD().sync();
+        }
+        // Same directory/volume, so this rename is atomic: a crash or OOM-kill mid-write can
+        // only ever leave the old marker (or none) in place, never a truncated/corrupt one
+        // that would make isSupportFilesMarkerCurrent() falsely trigger deleteOutdatedAssets()
+        // and wipe the whole support folder on the next launch.
+        if (!tempFile.renameTo(markerFile)) {
+            throw new IOException("Failed to finalize support files marker: " + markerFile.getAbsolutePath());
         }
     }
 
@@ -863,6 +872,9 @@ public class MainActivity extends SDLActivity{
     public native void nativeGamepadBackPressed();
     // Injects a directional menu nav key: dir 0=up 1=down 2=left 3=right.
     public native void nativeMenuNavKey(int dir, boolean pressed);
+    // Forwards a ComponentCallbacks2 TRIM_MEMORY_* level (or <=0 to mean "pressure cleared")
+    // to HiveShock so it can shrink/restore its live-enemy budget. See HiveShock.cpp.
+    public native void nativeTrimMemory(int level);
 
     public void SetFirstPersonAimingActive(boolean active) {
         mIsAiming = active;
@@ -873,6 +885,33 @@ public class MainActivity extends SDLActivity{
         super.onPause();
         setItemButtonHeld(false);
         mIsAiming = false;
+    }
+
+    @Override
+    protected void onResume() {
+        super.onResume();
+        if (!SDLActivity.mBrokenLibraries) {
+            nativeTrimMemory(0);
+        }
+    }
+
+    // Android's graduated memory-pressure signal. Forwarded to HiveShock so it can shrink
+    // (or clear) its live-enemy budget before the OS reclaims the process, instead of only
+    // finding out about low memory after a crash.
+    @Override
+    public void onTrimMemory(int level) {
+        super.onTrimMemory(level);
+        if (!SDLActivity.mBrokenLibraries) {
+            nativeTrimMemory(level);
+        }
+    }
+
+    @Override
+    public void onLowMemory() {
+        super.onLowMemory();
+        if (!SDLActivity.mBrokenLibraries) {
+            nativeTrimMemory(TRIM_MEMORY_COMPLETE);
+        }
     }
 
     @Override

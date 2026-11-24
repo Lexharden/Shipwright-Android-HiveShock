@@ -1,1 +1,4 @@
 * text=auto eol=lf
+
+# Patches keep the exact line endings of the files they target (libultraship has CRLF files).
+patches/*.patch -text
