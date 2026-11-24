@@ -1,30 +1,102 @@
-name: Android Release Build
+name: Release
+
+# Every pushed tag `vX.Y.Z[-suffix]` builds a signed release APK and publishes it as a GitHub Release.
+#   git tag -a v9.2.3-hiveshock.1 -m "Title" -m "Release notes..."
+#   git push origin v9.2.3-hiveshock.1
+# See docs/RELEASING.md for the one-time setup (signing secrets).
 
 on:
   push:
     tags:
-      - 'v*'
+      - 'v[0-9]+.[0-9]+.[0-9]+*'
+
+# One release build per tag at a time; never cancel a release that is already running.
+concurrency:
+  group: android-release-${{ github.ref }}
+  cancel-in-progress: false
+
+permissions:
+  contents: read
 
 jobs:
-  build:
+  release:
+    name: Build and publish
     runs-on: ubuntu-24.04
+    timeout-minutes: 120
     container:
       image: djvdw7f2ro/android-builder-soh:v1.0.4
     permissions:
-      id-token: write
+      contents: write # create the release and upload the APK
+      id-token: write # build provenance attestation
       attestations: write
-      contents: write
+
+    env:
+      TAG: ${{ github.ref_name }}
 
     steps:
       - name: Checkout
         uses: actions/checkout@v4
         with:
           submodules: recursive
+          fetch-depth: 0
 
-      - name: Fetch annotated tag
+      - name: Mark workspace safe and fetch the tag object
         run: |
           git config --global --add safe.directory "${GITHUB_WORKSPACE}"
-          git fetch origin "+refs/tags/${{ github.ref_name }}:refs/tags/${{ github.ref_name }}"
+          git fetch origin "+refs/tags/${TAG}:refs/tags/${TAG}"
+
+      - name: Derive version from the tag
+        id: version
+        run: |
+          if ! echo "${TAG}" | grep -Eq '^v[0-9]+\.[0-9]+\.[0-9]+([.-][0-9A-Za-z.-]+)?$'; then
+            echo "::error::Tag '${TAG}' does not look like vMAJOR.MINOR.PATCH[-suffix]"
+            exit 1
+          fi
+          VERSION="${TAG#v}"
+          # Monotonic Android versionCode: it must grow with every release so installs upgrade in place.
+          VERSION_CODE=$((1000 + GITHUB_RUN_NUMBER))
+          PRERELEASE=false
+          if echo "${VERSION}" | grep -Eqi '(^|[.-])(alpha|beta|rc|pre|dev)([.-]|[0-9]|$)'; then
+            PRERELEASE=true
+          fi
+          echo "name=${VERSION}" >> "$GITHUB_OUTPUT"
+          echo "code=${VERSION_CODE}" >> "$GITHUB_OUTPUT"
+          echo "prerelease=${PRERELEASE}" >> "$GITHUB_OUTPUT"
+          echo "Releasing ${VERSION} (versionCode ${VERSION_CODE}, prerelease=${PRERELEASE})"
+
+      - name: Check signing secrets
+        env:
+          KEYSTORE_B64: ${{ secrets.ANDROID_KEYSTORE_BASE64 }}
+          KEYSTORE_PASSWORD: ${{ secrets.ANDROID_KEYSTORE_PASSWORD }}
+          KEY_ALIAS: ${{ secrets.ANDROID_KEY_ALIAS }}
+          KEY_PASSWORD: ${{ secrets.ANDROID_KEY_PASSWORD }}
+        run: |
+          missing=""
+          [ -n "${KEYSTORE_B64}" ] || missing="${missing} ANDROID_KEYSTORE_BASE64"
+          [ -n "${KEYSTORE_PASSWORD}" ] || missing="${missing} ANDROID_KEYSTORE_PASSWORD"
+          [ -n "${KEY_ALIAS}" ] || missing="${missing} ANDROID_KEY_ALIAS"
+          [ -n "${KEY_PASSWORD}" ] || missing="${missing} ANDROID_KEY_PASSWORD"
+          if [ -n "${missing}" ]; then
+            echo "::error::Missing repository secrets:${missing}. See docs/RELEASING.md."
+            exit 1
+          fi
+
+      # libultraship is a submodule pinned to a commit that does not contain the Android data-root and touch-camera
+      # changes this port needs (Context::SetAndroidDataRootPath, MainActivity.setCameraTouchActive). They live in
+      # patches/ until they are published in a libultraship fork.
+      - name: Apply libultraship patch
+        run: |
+          PATCH="${GITHUB_WORKSPACE}/patches/libultraship-android.patch"
+          cd libultraship
+          if git apply --check "${PATCH}" 2>/dev/null; then
+            git apply "${PATCH}"
+            echo "libultraship patch applied"
+          elif git apply --reverse --check "${PATCH}" 2>/dev/null; then
+            echo "libultraship patch already present in the submodule commit"
+          else
+            echo "::error::patches/libultraship-android.patch no longer applies to the pinned libultraship commit"
+            exit 1
+          fi
 
       - name: Write local.properties
         run: |
@@ -43,61 +115,104 @@ jobs:
           cp soh/soh.o2r Android/app/src/main/assets/soh.o2r
 
       - name: Decode keystore
+        env:
+          KEYSTORE_B64: ${{ secrets.ANDROID_KEYSTORE_BASE64 }}
         run: |
-          echo '${{ secrets.ANDROID_KEYSTORE_BASE64 }}' | base64 -d > Android/app/release.jks
+          printf '%s' "${KEYSTORE_B64}" | base64 -d > Android/app/release.jks
 
       - name: Build release APK
         env:
           GIT_TAG: ${{ github.ref_name }}
+          KEYSTORE_PASSWORD: ${{ secrets.ANDROID_KEYSTORE_PASSWORD }}
+          KEY_ALIAS: ${{ secrets.ANDROID_KEY_ALIAS }}
+          KEY_PASSWORD: ${{ secrets.ANDROID_KEY_PASSWORD }}
         run: |
           cd Android && ./gradlew assembleRelease \
+            -PappVersionName="${{ steps.version.outputs.name }}" \
+            -PappVersionCode="${{ steps.version.outputs.code }}" \
             -PstoreFile=release.jks \
-            -PstorePassword=${{ secrets.ANDROID_KEYSTORE_PASSWORD }} \
-            -PkeyAlias=${{ secrets.ANDROID_KEY_ALIAS }} \
-            -PkeyPassword=${{ secrets.ANDROID_KEY_PASSWORD }}
+            -PstorePassword="${KEYSTORE_PASSWORD}" \
+            -PkeyAlias="${KEY_ALIAS}" \
+            -PkeyPassword="${KEY_PASSWORD}"
 
-      - name: Rename APK
+      - name: Remove keystore
+        if: always()
+        run: rm -f Android/app/release.jks
+
+      - name: Collect APK and checksum
+        id: apk
         run: |
           APK=$(find Android/app/build/outputs/apk/release -name 'soh_release_*.apk' | head -1)
-          mv "$APK" "soh-${{ github.ref_name }}.apk"
+          if [ -z "${APK}" ]; then
+            echo "::error::Release APK not found"
+            exit 1
+          fi
+          NAME="Shipwright-HiveShock-${TAG}.apk"
+          mv "${APK}" "${NAME}"
+          sha256sum "${NAME}" > "${NAME}.sha256"
+          echo "file=${NAME}" >> "$GITHUB_OUTPUT"
+          echo "hash=$(awk '{print $1}' "${NAME}.sha256")" >> "$GITHUB_OUTPUT"
 
-      - name: Compute SHA256
-        id: sha256
+      - name: Verify APK signature
         run: |
-          HASH=$(sha256sum "soh-${{ github.ref_name }}.apk" | awk '{print $1}')
-          echo "hash=${HASH}" >> "$GITHUB_OUTPUT"
+          APKSIGNER=$(find "${ANDROID_SDK_ROOT}/build-tools" -name apksigner | sort | tail -1)
+          if [ -z "${APKSIGNER}" ]; then
+            echo "::warning::apksigner not found, skipping signature verification"
+            exit 0
+          fi
+          "${APKSIGNER}" verify --verbose "${{ steps.apk.outputs.file }}"
 
       - name: Attest build provenance
         uses: actions/attest-build-provenance@v2
         with:
-          subject-path: soh-${{ github.ref_name }}.apk
+          subject-path: ${{ steps.apk.outputs.file }}
 
-      - name: Create GitHub release
+      - name: Keep the APK as a workflow artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: ${{ steps.apk.outputs.file }}
+          path: |
+            ${{ steps.apk.outputs.file }}
+            ${{ steps.apk.outputs.file }}.sha256
+          if-no-files-found: error
+          retention-days: 30
+
+      - name: Publish GitHub release
         env:
           GH_TOKEN: ${{ github.token }}
+          APK_FILE: ${{ steps.apk.outputs.file }}
+          APK_HASH: ${{ steps.apk.outputs.hash }}
+          PRERELEASE: ${{ steps.version.outputs.prerelease }}
+          OWNER: ${{ github.repository_owner }}
         run: |
-          TAG="${{ github.ref_name }}"
+          # An annotated tag's message is the release text; otherwise GitHub generates it from the commits and PRs
+          # since the previous release.
           OBJ_TYPE=$(git tag -l --format='%(objecttype)' "${TAG}")
-          if [ "${OBJ_TYPE}" != "tag" ]; then
-            echo "ERROR: '${TAG}' is a lightweight tag. Push an annotated tag to trigger a release."
-            exit 1
+          BODY=""
+          if [ "${OBJ_TYPE}" = "tag" ]; then
+            BODY=$(git tag -l --format='%(contents)' "${TAG}")
           fi
 
-          ANNOTATION_BODY=$(git tag -l --format='%(contents:body)' "${TAG}")
-          if [ -z "${ANNOTATION_BODY}" ]; then
-            ANNOTATION_BODY=$(printf '## Changes\n- Built from %s via CI' "${TAG}")
-          fi
+          {
+            if [ -n "${BODY}" ]; then printf '%s\n\n' "${BODY}"; fi
+            printf '### Install\n'
+            printf 'Download `%s` and install it on an arm64 Android 7.0+ device. The app is `dev.yafel.soh` ("SOH HiveShock") and keeps its own data, separate from other Ship of Harkinian builds.\n\n' "${APK_FILE}"
+            printf '### Verify\n'
+            printf 'SHA256: `%s`\n\n' "${APK_HASH}"
+            printf '`gh attestation verify %s --owner %s`\n\n' "${APK_FILE}" "${OWNER}"
+            printf 'Build: %s/%s/actions/runs/%s\n' "${{ github.server_url }}" "${{ github.repository }}" "${{ github.run_id }}"
+          } > release-notes.md
 
-          printf '%s\n\n' "${ANNOTATION_BODY}" > /tmp/release-notes.md
-          printf 'SHA256: %s\n' "${{ steps.sha256.outputs.hash }}" >> /tmp/release-notes.md
-          printf 'Verify: `gh attestation verify soh-%s.apk --owner linkzenic`\n' "${TAG}" >> /tmp/release-notes.md
-          printf 'Build: %s/%s/actions/runs/%s\n' "${{ github.server_url }}" "${{ github.repository }}" "${{ github.run_id }}" >> /tmp/release-notes.md
+          FLAGS=""
+          [ "${PRERELEASE}" = "true" ] && FLAGS="--prerelease"
 
           if gh release view "${TAG}" >/dev/null 2>&1; then
-            gh release upload "${TAG}" "soh-${TAG}.apk" --clobber
+            gh release upload "${TAG}" "${APK_FILE}" "${APK_FILE}.sha256" --clobber
           else
-            gh release create "${TAG}" \
-              "soh-${TAG}.apk" \
+            gh release create "${TAG}" "${APK_FILE}" "${APK_FILE}.sha256" \
+              --verify-tag \
               --title "${TAG}" \
-              --notes-file /tmp/release-notes.md
+              --notes-file release-notes.md \
+              --generate-notes \
+              ${FLAGS}
           fi

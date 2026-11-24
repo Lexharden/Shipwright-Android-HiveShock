@@ -17,6 +17,12 @@ jobs:
         with:
           submodules: recursive
 
+      - name: Apply libultraship patch
+        run: |
+          PATCH="${GITHUB_WORKSPACE}/patches/libultraship-android.patch"
+          cd libultraship
+          git apply --check "${PATCH}" 2>/dev/null && git apply "${PATCH}" || git apply --reverse --check "${PATCH}"
+
       - name: Write local.properties
         run: |
           echo "sdk.dir=${ANDROID_SDK_ROOT}" > Android/local.properties
@@ -42,12 +48,17 @@ jobs:
           GIT_TAG: test-${{ github.run_number }}
         run: |
           cd Android && ./gradlew assembleRelease \
-            -PsohApplicationId=com.linkzenic.soh.touchcontroltest \
-            -PsohConfigFile=shipofharkinian-touchcontroltest.json \
+            -PsohApplicationId=dev.yafel.soh.test \
             -PstoreFile=release.jks \
             -PstorePassword=${{ secrets.ANDROID_KEYSTORE_PASSWORD }} \
             -PkeyAlias=${{ secrets.ANDROID_KEY_ALIAS }} \
-            -PkeyPassword=${{ secrets.ANDROID_KEY_PASSWORD }}
+            -PkeyPassword=${{ secrets.ANDROID_KEY_PASSWORD }} \
+            -PappVersionName=test-${{ github.run_number }} \
+            -PappVersionCode=$((1000 + ${{ github.run_number }}))
+
+      - name: Remove keystore
+        if: always()
+        run: rm -f Android/app/release.jks
 
       - name: Prepare APK artifact
         run: |

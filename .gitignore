@@ -461,3 +461,9 @@ soh/properties.h
 /clang-format.exe
 *.o2r
 local.properties
+
+# Local debugging artifacts
+Android/crash-debug.txt
+soh/src/overlays/actors.zip
+Android/app/release.jks
+*.jks
