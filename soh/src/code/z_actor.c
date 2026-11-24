@@ -3340,7 +3340,9 @@ Actor* Actor_Spawn(ActorContext* actorCtx, PlayState* play, s16 actorId, f32 pos
 
     objBankIndex = Object_GetIndex(&gPlayState->objectCtx, dbEntry->objectId);
 
-    if (objBankIndex < 0 && (!gMapLoading || CVarGetInteger(CVAR_ENHANCEMENT("RandomizedEnemies"), 0))) {
+    if (objBankIndex < 0 && (!gMapLoading || CVarGetInteger(CVAR_ENHANCEMENT("RandomizedEnemies"), 0) ||
+                             CVarGetInteger(CVAR_REMOTE_CROWD_CONTROL("Enabled"), 0) ||
+                             CVarGetInteger(CVAR_REMOTE_HIVESHOCK("Enabled"), 0))) {
         objBankIndex = 0;
     }
 

@@ -1,0 +1,3031 @@
+// soh/soh/Network/HiveShock/HiveShock.cpp
+//
+// Native TCP listen server compiled into soh.exe for the HiveShock companion.
+// Accepts JSON commands (one object per line) on 0.0.0.0:43000 and applies
+// them on the game thread.
+
+#if !defined(__SWITCH__) && !defined(__WIIU__) && defined(_WIN32)
+#define _WINSOCK_DEPRECATED_NO_WARNINGS
+#ifndef WIN32_LEAN_AND_MEAN
+#define WIN32_LEAN_AND_MEAN
+#endif
+#ifndef NOMINMAX
+#define NOMINMAX
+#endif
+#include <winsock2.h>
+#include <ws2tcpip.h>
+#ifdef _MSC_VER
+#pragma comment(lib, "Ws2_32.lib")
+#endif
+#endif
+
+#include "HiveShock.h"
+#include "HiveShockAdmission.h"
+
+#include <libultraship/bridge/consolevariablebridge.h>
+#include "soh/ActorDB.h"
+#include "soh/Enhancements/game-interactor/GameInteractor.h"
+#include "soh/Enhancements/nametag.h"
+#include "soh/SaveManager.h"
+#include "soh/ShipInit.hpp"
+#include "soh/cvar_prefixes.h"
+#include "overlays/actors/ovl_En_Bb/z_en_bb.h"
+#include "overlays/actors/ovl_En_Am/z_en_am.h"
+#include "overlays/actors/ovl_En_Dh/z_en_dh.h"
+#include "overlays/actors/ovl_En_GeldB/z_en_geldb.h"
+#include "overlays/actors/ovl_En_Elf/z_en_elf.h"
+#include "overlays/actors/ovl_En_Niw/z_en_niw.h"
+#include "overlays/actors/ovl_En_Md/z_en_md.h"
+
+#include <nlohmann/json.hpp>
+#include <spdlog/spdlog.h>
+
+#include <ship/Context.h>
+#include <ship/window/Window.h>
+#include <ship/window/gui/ConsoleWindow.h>
+
+#include <algorithm>
+#include <atomic>
+#include <chrono>
+#include <ctime>
+#include <deque>
+#include <filesystem>
+#include <fstream>
+#include <mutex>
+#include <string>
+#include <thread>
+#include <vector>
+
+#ifdef __ANDROID__
+#include <jni.h>
+#endif
+
+#if !defined(__SWITCH__) && !defined(__WIIU__)
+
+#ifndef _WIN32
+#include <arpa/inet.h>
+#include <errno.h>
+#include <fcntl.h>
+#include <poll.h>
+#include <ifaddrs.h>
+#include <net/if.h>
+#include <netinet/in.h>
+#include <sys/select.h>
+#include <sys/socket.h>
+#include <unistd.h>
+#endif
+
+#include "HiveShockBossDeath.h" // gHiveShockBossSpawn and the slot limits of the Ganon bosses
+
+extern "C" {
+#include <z64.h>
+#include "variables.h"
+#include "functions.h"
+#include "macros.h"
+extern PlayState* gPlayState;
+}
+
+#define CVAR_NAME CVAR_REMOTE_HIVESHOCK("Enabled")
+#define CVAR_ENABLED CVarGetInteger(CVAR_NAME, 0)
+
+using json = nlohmann::json;
+using Clock = std::chrono::steady_clock;
+
+namespace {
+
+constexpr int kDefaultPort = 43000;
+constexpr int kPollIntervalMs = 200;
+constexpr int kEventPort = 43002;
+constexpr size_t kMaxLineBytes = 8192;
+// Commands and spawns are never dropped to make room: a viewer paid for them. These only bound memory, and when
+// they are exceeded the NEWEST entry is rejected (and logged), never an older one.
+constexpr size_t kMaxQueueSize = 1024;
+constexpr size_t kMaxPendingSpawns = 1000;
+constexpr size_t kMaxNameTagChars = 18;
+constexpr s16 kMinHealthAfterDamage = 4;
+
+// Hard engine limits. Collider slot headroom (z64collision_check.h) is 50/60/50 on every platform, unchanged from the
+// original N64 limits, so the real per-platform budget is how many simultaneously-simulated actors a device can carry,
+// which is why the defaults start lower on Android. Reaching a limit delays spawns, it never removes an enemy. The
+// player can raise them in Network > HiveShock (gRemote.HiveShock.MaxAlive / MaxSceneEnemies / MaxLoad), and they are
+// scaled down further at runtime under OS memory pressure (see gBudgetPercent).
+#if defined(__ANDROID__)
+constexpr s32 kDefaultMaxAlive = 16;
+constexpr s32 kDefaultMaxSceneEnemies = 20;
+// Soft budget: sum of SpawnDef::weight of the live injected enemies.
+constexpr s32 kDefaultMaxLoad = 8;
+constexpr s32 kDefaultEliteReserve = 6;
+#else
+constexpr s32 kDefaultMaxAlive = 32;
+constexpr s32 kDefaultMaxSceneEnemies = 40;
+constexpr s32 kDefaultMaxLoad = 14;
+constexpr s32 kDefaultEliteReserve = 10;
+#endif
+// Gameplay runs at 20 frames/s. Spawns are released at most one every ~0.4 s so a refill never arrives as a burst.
+constexpr u32 kSpawnGapFrames = 8;
+// Enemies this heavy or heavier are "elite": they go ahead of the ordinary ones in the queue. Turn off with
+// gRemote.HiveShock.ElitePriority.
+constexpr u8 kEliteWeight = 3;
+// Elite head start: points reserved for elite enemies on top of MaxLoad, so the first ones enter at once
+// (gRemote.HiveShock.EliteReserve, 0 turns it off). It is only a head start, not a ceiling: elites can also use the
+// whole ordinary pool, and while one waits for room, the room that frees up as ordinary enemies die is reserved for
+// it (the ordinary lane pauses), piling up kill after kill until it fits. See HiveShockAdmission.h for the rules.
+constexpr s32 kMaxEliteReserve = 40;
+constexpr s32 kOrdinaryFloor = 0;
+constexpr u32 kEliteWaitLogTicks = 100;
+// Retry cadence for a spawn that is held (not allowed here right now) or that failed to place an actor.
+constexpr u32 kHeldRecheckFrames = 10;
+constexpr u32 kHeldLogTicks = 100;
+constexpr u32 kFailedRetryFrames = 20;
+constexpr u32 kCuccoArmyFrameGap = 4;
+// After the room changes, injected enemies that vanish while still alive were dropped by the room swap (not killed),
+// so they are queued again instead of being lost.
+constexpr u32 kRoomGraceTicks = 40;
+// An injected enemy this far from Link for this long is considered stuck and is moved next to him.
+constexpr f32 kStuckDistance = 700.0f;
+constexpr u32 kStuckTicks = 20 * 20;
+constexpr u32 kStuckCheckTicks = 20;
+// Pending spawns are written to disk (throttled) so a crash or restart does not lose what viewers paid for.
+constexpr u32 kBacklogSaveTicks = 100;
+constexpr s64 kBacklogMaxAgeSeconds = 12 * 60 * 60;
+constexpr u32 kQueueReportTicks = 10;
+constexpr const char* kBacklogFileName = "hiveshock_pending.json";
+constexpr float kDefaultShockDamage = 8.0f;
+constexpr f32 kDefaultSpeedMult = 2.0f;
+constexpr f32 kDefaultSlowMult = 0.5f;
+constexpr f32 kDefaultDamageMult = 3.0f;
+constexpr float kDefaultBuffSeconds = 20.0f;
+
+#ifdef _WIN32
+using SocketHandle = SOCKET;
+constexpr SocketHandle kInvalidSocket = INVALID_SOCKET;
+#else
+using SocketHandle = int;
+constexpr SocketHandle kInvalidSocket = -1;
+#endif
+
+// Applied: done. Deferred: not possible right now for everybody (cutscene, room load), so stop and retry later.
+// LaneFull: this lane (elite or ordinary) has no room, so stop scanning THAT lane (its first enemy keeps its turn) but
+// let the other one go on. Held: not possible for THIS entry only (a boss room, the Lizalfos mini-boss), so keep it and
+// let others pass. Skipped: failed this time (e.g. no actor could be placed), retry later. Rejected: unknown command.
+enum class ApplyResult { Applied, Deferred, LaneFull, Held, Skipped, Rejected };
+
+enum class BridgeBuff : u8 {
+    Speed = 0,
+    Invincible,
+    InfiniteMagic,
+    DamageUp,
+    Count,
+};
+
+struct BuffState {
+    bool active = false;
+    Clock::time_point until{};
+    f32 strength = 1.0f;
+};
+
+struct SpawnDef {
+    const char* name;
+    s16 actorId;
+    s32 params;
+    bool useSpawnActor;
+    // How much of the MaxLoad budget a live instance uses (0 = free: fairy, bombchu).
+    u8 weight;
+};
+
+struct WarpAlias {
+    const char* name;
+    s32 entrance;
+};
+
+struct PendingSpawn {
+    std::string name;
+    std::string user;
+    u32 earliestTick = 0; // compared against gTick
+    u32 attempts = 0;     // failed placements, only used to throttle logging
+    s64 createdAt = 0;    // unix seconds, only used to expire entries restored from disk
+    bool requeued = false; // an enemy that was already counted as spawned and is coming back after a scene change
+};
+
+struct TrackedEnemy {
+    Actor* actor = nullptr;
+    const SpawnDef* def = nullptr;
+    std::string user;
+    u32 spawnTick = 0;
+    u8 weight = 0;
+    bool alive = true;      // false once it was seen dead (health reached 0): a dying enemy is not requeued
+    bool sawHealth = false; // some actors (cuccos) never have health, so "health == 0" only means dead if it was > 0
+    u32 farSinceTick = 0;   // 0 = close enough to Link
+    // Some actors (e.g. the "big" Floormaster) spawn extra actors of their own and link them together via
+    // actor->parent/actor->child, with no update==NULL guard before dereferencing that link elsewhere in their own
+    // code. Killing `actor` alone would leave the linked ones holding a dangling pointer, so they are tracked here
+    // and killed together with it.
+    Actor* linkedA = nullptr;
+    Actor* linkedB = nullptr;
+};
+
+// A Kaepora or a Mido sent by a viewer. They are not enemies: they do not count in the load, the headcount or the
+// counters, are never moved or queued again, and go away by themselves (see UpdatePests).
+struct PestState {
+    Actor* actor = nullptr;
+    const SpawnDef* def = nullptr;
+    u32 expireTick = 0;
+};
+
+// A Navi sent by a viewer. She follows Link through rooms and scenes (she is invoked again after each scene load) and
+// is only dismissed when Link dies.
+struct NaviState {
+    Actor* actor = nullptr;
+    const SpawnDef* def = nullptr;
+    std::string user;
+};
+
+std::mutex gQueueMutex;
+std::deque<json> gCommandQueue;
+
+
+std::atomic<bool> gServerRun{ false };
+std::atomic<bool> gListening{ false };
+std::atomic<bool> gClientConnected{ false };
+std::atomic<int> gDeathCount{ 0 };
+// Joins the server thread on destruction. A joinable std::thread destroyed during static teardown calls
+// std::terminate(), which aborted the game on exit whenever HiveShock was still enabled.
+struct ServerThreadHolder {
+    std::thread thread;
+    ~ServerThreadHolder() {
+        gServerRun = false;
+        if (thread.joinable()) {
+            thread.join();
+        }
+    }
+};
+ServerThreadHolder gServerThreadHolder;
+std::atomic<uint16_t> gPort{ kDefaultPort };
+
+bool gDeathCountedThisCycle = false;
+u16 gSavedTimeSpeed = 0;
+bool gTimeIsFrozen = false;
+bool gTimeFreezeHasDeadline = false;
+Clock::time_point gTimeFrozenUntil{};
+bool gInvertControls = false;
+Clock::time_point gInvertUntil{};
+BuffState gBuffs[static_cast<size_t>(BridgeBuff::Count)]{};
+
+// Spawns waiting for room in the budget, oldest first. Survives scene changes and game over; only an explicit
+// Disable() clears it.
+std::deque<PendingSpawn> gPendingSpawns;
+std::vector<TrackedEnemy> gTrackedEnemies;
+std::vector<PestState> gPests;
+std::vector<NaviState> gNavis;
+NaviState* gNaviRespawnSlot = nullptr; // set while a lost Navi is being invoked again, so she is not added twice
+// True while Actor_Spawn runs for a pest: lets the VB_MIDO_SPAWN hook tell HiveShock's Mido from the game's.
+bool gPestSpawning = false;
+// Monotonic game-update counter. Unlike gameplayFrames it does not restart on every scene load, so delays and
+// spacing computed from it stay valid across scene changes.
+u32 gTick = 0;
+u32 gNextSpawnTick = 0;
+u32 gLastEliteWaitLogTick = 0;
+u32 gLastHeldLogTick = 0;
+u32 gRoomGraceUntilTick = 0;
+s16 gLastRoom = -1;
+bool gBacklogDirty = false;
+bool gBacklogLoaded = false;
+u32 gLastBacklogSaveTick = 0;
+u32 gLastQueueReportTick = 0;
+bool gQueueReportForce = true;
+std::string gLastQueueReport;
+
+
+// Enemy counters shown to the user (see HiveShock::Stats). Written by the game thread, read by the UI.
+std::atomic<int> gStatTotal{ 0 };
+std::atomic<int> gStatSpawned{ 0 };
+std::atomic<int> gStatDefeated{ 0 };
+std::atomic<int> gStatAlive{ 0 };
+std::atomic<int> gStatWaiting{ 0 };
+std::atomic<int> gStatEliteBank{ 0 };    // elite points in use inside the bank
+std::atomic<int> gStatEliteBankMax{ 0 }; // size of the bank
+std::atomic<int> gStatEliteWaiting{ 0 };
+
+// Runtime budget scale (percent of the configured caps), lowered in response to OS memory-pressure callbacks
+// (Android onTrimMemory/onLowMemory -> HiveShock::OnMemoryPressure) and restored once pressure clears. Only atomics
+// are touched from the callback thread; the actual clean-up runs on the game thread (see gClearRequested).
+std::atomic<s32> gBudgetPercent{ 100 };
+// While true, TickPendingSpawns() drains nothing: gifts keep queuing in the backlog instead of instantiating new
+// actors, until memory pressure clears.
+std::atomic<bool> gSpawnsSuspended{ false };
+std::atomic<bool> gClearRequested{ false };
+
+// Returns the first non-loopback IPv4 address found on any network interface,
+// or "0.0.0.0" if none is available. Used to display the bind address in the UI.
+std::string GetLocalIPImpl() {
+#ifdef _WIN32
+    char hostname[256];
+    if (gethostname(hostname, sizeof(hostname)) != 0) {
+        return "0.0.0.0";
+    }
+    struct addrinfo hints{};
+    hints.ai_family = AF_INET;
+    hints.ai_socktype = SOCK_STREAM;
+    struct addrinfo* res = nullptr;
+    if (getaddrinfo(hostname, nullptr, &hints, &res) != 0 || res == nullptr) {
+        return "0.0.0.0";
+    }
+    char buf[INET_ADDRSTRLEN];
+    const char* ip = inet_ntop(AF_INET,
+        &reinterpret_cast<sockaddr_in*>(res->ai_addr)->sin_addr, buf, sizeof(buf));
+    freeaddrinfo(res);
+    return ip ? std::string(ip) : "0.0.0.0";
+#else
+    struct ifaddrs* ifap = nullptr;
+    if (getifaddrs(&ifap) != 0 || ifap == nullptr) {
+        return "0.0.0.0";
+    }
+    std::string result = "0.0.0.0";
+    for (struct ifaddrs* ifa = ifap; ifa != nullptr; ifa = ifa->ifa_next) {
+        if (ifa->ifa_addr == nullptr) continue;
+        if (ifa->ifa_addr->sa_family != AF_INET) continue;
+        if (!(ifa->ifa_flags & IFF_UP)) continue;
+        if (ifa->ifa_flags & IFF_LOOPBACK) continue;
+        char buf[INET_ADDRSTRLEN];
+        const char* ip = inet_ntop(AF_INET,
+            &reinterpret_cast<struct sockaddr_in*>(ifa->ifa_addr)->sin_addr, buf, sizeof(buf));
+        if (ip) {
+            result = std::string(ip);
+            break;
+        }
+    }
+    freeifaddrs(ifap);
+    return result;
+#endif
+}
+
+
+constexpr SpawnDef kSpawnTable[] = {
+    { "enemy", ACTOR_EN_RR, 0, false, 2 },
+    { "like_like", ACTOR_EN_RR, 0, false, 2 },
+    { "guay", ACTOR_EN_CROW, 0, false, 1 },
+    { "keese", ACTOR_EN_FIREFLY, 2, false, 1 },
+    { "fire_keese", ACTOR_EN_FIREFLY, 1, false, 1 },
+    { "ice_keese", ACTOR_EN_FIREFLY, 4, false, 1 },
+    { "chuchu", ACTOR_EN_TITE, 0, false, 2 },
+    { "redead", ACTOR_EN_RD, 0, false, 2 },
+    { "gibdo", ACTOR_EN_RD, 32766, false, 2 },
+    { "wolfos", ACTOR_EN_WF, (0xFF << 8), false, 2 },
+    { "white_wolfos", ACTOR_EN_WF, (0xFF << 8) | 1, false, 3 },
+    { "stalchild", ACTOR_EN_SKB, 0, false, 1 },
+    { "stalfos", ACTOR_EN_TEST, 2, false, 3 },
+    // params must be ENBB_BLUE (-1, see z_en_bb.h). With params=0 the 0x80 type-select bit
+    // is never set, so EnBb_Init falls into its "flame trail segment" branch instead of a
+    // real bubble and dereferences an uninitialized this->targetActor on the next tick --
+    // an instant crash. -1 gives the normal blue Bubble.
+    { "bubble", ACTOR_EN_BB, -1, false, 1 },
+    { "skulltula", ACTOR_EN_ST, 0, false, 1 },
+    { "bat", ACTOR_EN_FIREFLY, 2, false, 1 },
+    { "tektite", ACTOR_EN_TITE, 0, false, 1 },
+    { "blue_tektite", ACTOR_EN_TITE, -1, false, 2 },
+    { "freezard", ACTOR_EN_FZ, 0, false, 1 },
+    { "cucco", ACTOR_EN_NIW, 0, true, 1 },
+    // An ordinary cucco: same actor, but left alone (see SpawnDefNow). It wanders, can be picked up and only gets
+    // angry if Link hits it. Not an enemy.
+    { "cucco_calm", ACTOR_EN_NIW, 0, true, 0 },
+    { "dinolfos", ACTOR_EN_ZF, (0xFF << 8) | 0xFE, false, 3 },
+    { "lizalfos", ACTOR_EN_ZF, (0xFF << 8) | 0xFF, false, 3 },
+    { "iron_knuckle", ACTOR_EN_IK, (0xFF << 8) | 2, false, 4 },
+    { "wallmaster", ACTOR_EN_WALLMAS, 0, false, 2 },
+    // params=0 spawns the "big" Floormaster, which immediately spawns two more small,
+    // linked child actors of its own (see TrackBridgeEnemy(): the whole trio is tracked
+    // and evicted together so this stays safe). Using SPAWN_SMALL instead would avoid that,
+    // but a lone small Floormaster is spawned invisible and permanently idle (EnFloormas_SmWait
+    // is a no-op that only a "big" parent ever breaks it out of) -- it would never attack.
+    { "floormaster", ACTOR_EN_FLOORMAS, 0, false, 3 },
+    { "dark_link", ACTOR_EN_TORCH2, 0, false, 4 },
+    { "arwing", ACTOR_EN_CLEAR_TAG, 1, false, 2 },
+    // Mini-bosses and dungeon enemies. Same params the enemy randomizer already spawns outside their rooms.
+    // Dead Hand: its params are ignored by Init; it is woken up after spawning (see SpawnDefNow).
+    { "dead_hand", ACTOR_EN_DH, 0, false, 4 },
+    // Nabooru's Iron Knuckle: switch flag 0xFF marks it as HiveShock's (see EnIk_Init), so no story flag is touched.
+    { "nabooru", ACTOR_EN_IK, (0xFF << 8), false, 5 },
+    { "dodongo", ACTOR_EN_DODONGO, -1, false, 3 },
+    { "baby_dodongo", ACTOR_EN_DODOJR, 0, false, 1 },
+    { "biri", ACTOR_EN_BILI, 0, false, 1 },
+    { "anubis", ACTOR_EN_ANUBICE_TAG, 1, false, 3 },
+    { "flying_pot", ACTOR_EN_TUBO_TRAP, 0, false, 1 },
+    // The real Ganondorf and Ganon (beast) of the final fights, started straight in the fight with no cutscene and
+    // around the spot they spawn at; when beaten they explode (see the gHiveShockBossSpawn notes in z_boss_ganon.c
+    // and z_boss_ganon2.c). Separate spawns: the beast is not a transformation of Ganondorf.
+    { "ganondorf", ACTOR_BOSS_GANON, 0, false, 6 },
+    { "ganon_beast", ACTOR_BOSS_GANON2, 0, false, 8 },
+    // Barinade: params -1 is the body, which builds the rest (see the gHiveShockBossSpawn notes in z_boss_va.c).
+    { "barinade", ACTOR_BOSS_VA, -1, false, 8 },
+    // Birova (Twinrova): the second phase of the fight, started straight away around Link wherever he is (see the
+    // gHiveShockBossSpawn notes in z_boss_tw.c). Params 2 is Twinrova herself; she brings her sisters, hidden.
+    { "birova", ACTOR_BOSS_TW, 2, false, 8 },
+    // Gerudo Fighter with no key flag: see the VB hooks in RegisterHiveShock. Armos -1 is the enemy variant and is
+    // woken after spawning. Peahat -1 is the big grounded one (it rises when Link is close and sheds larvae).
+    { "gerudo_fighter", ACTOR_EN_GELDB, 0, false, 3 },
+    { "flare_dancer", ACTOR_EN_FD, 0, false, 4 },
+    { "armos", ACTOR_EN_AM, -1, false, 2 },
+    { "peahat", ACTOR_EN_PEEHAT, -1, false, 3 },
+    // Params 7 is the non-Gohma egg: it hatches by itself when Link is within 100 units, so it spawns close.
+    { "gohma_larva", ACTOR_EN_GOMA, 7, false, 1 },
+    { "fairy", ACTOR_EN_ELF, FAIRY_HEAL, true, 0 },
+    // Navi (params 0 = FAIRY_NAVI): follows Link around and carries the name tag of whoever sent her. Not an enemy.
+    { "navi", ACTOR_EN_ELF, FAIRY_NAVI, true, 0 },
+    // Kaepora Gaebora: params 0xBF is the Hyrule Castle owl (the longest talk, no save flag; switch flag 0x3F is never
+    // read or written). He talks to Link by himself and the cursor starts on "repeat". Not an enemy (see PestState).
+    { "owl", ACTOR_EN_OWL, 0xBF, false, 0 },
+    // Mido as a wall in front of Link: params 0xFF00 means "no path". Not an enemy (see PestState).
+    { "mido", ACTOR_EN_MD, static_cast<s16>(0xFF00), false, 0 },
+    { "bombchu", ACTOR_EN_BOM_CHU, 0, true, 0 },
+};
+
+constexpr const char* kRandomEnemies[] = {
+    "guay",       "keese",     "fire_keese", "ice_keese", "tektite", "redead", "wolfos", "stalchild",
+    "bubble",     "skulltula", "freezard",   "like_like", "stalfos", "dinolfos", "lizalfos", "iron_knuckle", "floormaster",
+};
+
+constexpr WarpAlias kWarpAliases[] = {
+    { "home", ENTR_LINKS_HOUSE_CHILD_SPAWN },
+    { "links_house", ENTR_LINKS_HOUSE_CHILD_SPAWN },
+    { "minuet", ENTR_SACRED_FOREST_MEADOW_WARP_PAD },
+    { "forest", ENTR_SACRED_FOREST_MEADOW_WARP_PAD },
+    { "woodfall", ENTR_SACRED_FOREST_MEADOW_WARP_PAD },
+    { "sacred_forest_meadow", ENTR_SACRED_FOREST_MEADOW_WARP_PAD },
+    { "bolero", ENTR_DEATH_MOUNTAIN_CRATER_WARP_PAD },
+    { "crater", ENTR_DEATH_MOUNTAIN_CRATER_WARP_PAD },
+    { "snowhead", ENTR_DEATH_MOUNTAIN_CRATER_WARP_PAD },
+    { "death_mountain", ENTR_DEATH_MOUNTAIN_CRATER_WARP_PAD },
+    { "serenade", ENTR_LAKE_HYLIA_WARP_PAD },
+    { "lake", ENTR_LAKE_HYLIA_WARP_PAD },
+    { "lake_hylia", ENTR_LAKE_HYLIA_WARP_PAD },
+    { "great_bay", ENTR_LAKE_HYLIA_WARP_PAD },
+    { "requiem", ENTR_DESERT_COLOSSUS_WARP_PAD },
+    { "desert", ENTR_DESERT_COLOSSUS_WARP_PAD },
+    { "colossus", ENTR_DESERT_COLOSSUS_WARP_PAD },
+    { "ikana", ENTR_DESERT_COLOSSUS_WARP_PAD },
+    { "stone_tower", ENTR_DESERT_COLOSSUS_WARP_PAD },
+    { "nocturne", ENTR_GRAVEYARD_WARP_PAD },
+    { "graveyard", ENTR_GRAVEYARD_WARP_PAD },
+    { "prelude", ENTR_TEMPLE_OF_TIME_WARP_PAD },
+    { "temple", ENTR_TEMPLE_OF_TIME_WARP_PAD },
+    { "temple_of_time", ENTR_TEMPLE_OF_TIME_WARP_PAD },
+    { "clock_town", ENTR_TEMPLE_OF_TIME_WARP_PAD },
+};
+
+constexpr s32 kRandomWarps[] = {
+    ENTR_LINKS_HOUSE_CHILD_SPAWN,     ENTR_SACRED_FOREST_MEADOW_WARP_PAD, ENTR_DEATH_MOUNTAIN_CRATER_WARP_PAD,
+    ENTR_LAKE_HYLIA_WARP_PAD,         ENTR_DESERT_COLOSSUS_WARP_PAD,      ENTR_GRAVEYARD_WARP_PAD,
+    ENTR_TEMPLE_OF_TIME_WARP_PAD,
+};
+
+const SpawnDef* FindSpawnDef(const std::string& name);
+void KillTrackedActor(Actor* actor);
+
+float GetNumber(const json& cmd, float defaultValue) {
+    if (cmd.contains("strength") && cmd["strength"].is_number()) {
+        return cmd["strength"].get<float>();
+    }
+    if (cmd.contains("value") && cmd["value"].is_number()) {
+        return cmd["value"].get<float>();
+    }
+    return defaultValue;
+}
+
+float GetDuration(const json& cmd) {
+    if (cmd.contains("duration") && cmd["duration"].is_number()) {
+        return std::max(0.0f, cmd["duration"].get<float>());
+    }
+    return 0.0f;
+}
+
+std::string GetStringField(const json& cmd, const char* key) {
+    if (cmd.contains(key) && cmd[key].is_string()) {
+        return cmd[key].get<std::string>();
+    }
+    return "";
+}
+
+void LogUser(const json& cmd, const std::string& action) {
+    std::string user = GetStringField(cmd, "user");
+    if (!user.empty()) {
+        SPDLOG_INFO("[HiveShock] action '{}' from '{}'", action, user);
+    }
+}
+
+const char* BuffName(BridgeBuff buff) {
+    switch (buff) {
+        case BridgeBuff::Speed:
+            return "speed";
+        case BridgeBuff::Invincible:
+            return "invincible";
+        case BridgeBuff::InfiniteMagic:
+            return "infinite_magic";
+        case BridgeBuff::DamageUp:
+            return "damage_up";
+        default:
+            return "buff";
+    }
+}
+
+bool IsBuffActive(BridgeBuff buff) {
+    const BuffState& state = gBuffs[static_cast<size_t>(buff)];
+    return state.active && Clock::now() < state.until;
+}
+
+f32 GetBuffStrength(BridgeBuff buff, f32 fallback) {
+    if (!IsBuffActive(buff)) {
+        return fallback;
+    }
+    return gBuffs[static_cast<size_t>(buff)].strength;
+}
+
+float CurrentOutgoingDamageMultiplier() {
+    return GetBuffStrength(BridgeBuff::DamageUp, 1.0f);
+}
+
+void CloseSocket(SocketHandle socket) {
+    if (socket == kInvalidSocket) {
+        return;
+    }
+#ifdef _WIN32
+    closesocket(socket);
+#else
+    close(socket);
+#endif
+}
+
+// Initializes the platform socket layer for the lifetime of the object (Winsock refcounts per call).
+struct NetSession {
+    bool ok = true;
+#ifdef _WIN32
+    NetSession() {
+        WSADATA wsaData;
+        ok = WSAStartup(MAKEWORD(2, 2), &wsaData) == 0;
+    }
+    ~NetSession() {
+        if (ok) {
+            WSACleanup();
+        }
+    }
+#endif
+};
+
+int LastSocketError() {
+#ifdef _WIN32
+    return WSAGetLastError();
+#else
+    return errno;
+#endif
+}
+
+bool LastSocketErrorIsTransient() {
+#ifdef _WIN32
+    int err = WSAGetLastError();
+    return err == WSAEINTR || err == WSAEWOULDBLOCK;
+#else
+    return errno == EINTR || errno == EAGAIN || errno == EWOULDBLOCK || errno == ECONNABORTED;
+#endif
+}
+
+bool ConnectInProgress() {
+#ifdef _WIN32
+    int err = WSAGetLastError();
+    return err == WSAEWOULDBLOCK || err == WSAEINPROGRESS;
+#else
+    return errno == EINPROGRESS || errno == EINTR;
+#endif
+}
+
+// Per-socket options. macOS/BSD have no MSG_NOSIGNAL, so a write to a closed peer would raise SIGPIPE and
+// kill the whole game; SO_NOSIGPIPE turns that into a plain EPIPE error instead.
+void ConfigureSocket(SocketHandle sock) {
+#ifdef SO_NOSIGPIPE
+    int on = 1;
+    setsockopt(sock, SOL_SOCKET, SO_NOSIGPIPE, &on, sizeof(on));
+#else
+    (void)sock;
+#endif
+}
+
+void SetNonBlocking(SocketHandle sock, bool enable) {
+#ifdef _WIN32
+    u_long mode = enable ? 1 : 0;
+    ioctlsocket(sock, FIONBIO, &mode);
+#else
+    int flags = fcntl(sock, F_GETFL, 0);
+    if (flags >= 0) {
+        fcntl(sock, F_SETFL, enable ? (flags | O_NONBLOCK) : (flags & ~O_NONBLOCK));
+    }
+#endif
+}
+
+// Waits until the socket is readable (or, if !forRead, writable). poll() has no FD_SETSIZE limit,
+// unlike select(), which matters on macOS where fds can exceed 1024 in a game process.
+bool WaitForSocket(SocketHandle sock, bool forRead, int timeoutMs) {
+#ifdef _WIN32
+    WSAPOLLFD pfd{};
+    pfd.fd = sock;
+    pfd.events = forRead ? POLLRDNORM : POLLWRNORM;
+    return WSAPoll(&pfd, 1, timeoutMs) > 0;
+#else
+    pollfd pfd{};
+    pfd.fd = sock;
+    pfd.events = forRead ? POLLIN : POLLOUT;
+    return poll(&pfd, 1, timeoutMs) > 0;
+#endif
+}
+
+// Polls two sockets for readability. Returns a bitmask: 1 = a readable, 2 = b readable.
+int WaitForEitherReadable(SocketHandle a, SocketHandle b, int timeoutMs) {
+#ifdef _WIN32
+    WSAPOLLFD fds[2]{};
+    fds[0].fd = a;
+    fds[0].events = POLLRDNORM;
+    fds[1].fd = b;
+    fds[1].events = POLLRDNORM;
+    if (WSAPoll(fds, 2, timeoutMs) <= 0) {
+        return 0;
+    }
+    return ((fds[0].revents & (POLLRDNORM | POLLHUP | POLLERR)) ? 1 : 0) |
+           ((fds[1].revents & (POLLRDNORM | POLLHUP | POLLERR)) ? 2 : 0);
+#else
+    pollfd fds[2]{};
+    fds[0].fd = a;
+    fds[0].events = POLLIN;
+    fds[1].fd = b;
+    fds[1].events = POLLIN;
+    if (poll(fds, 2, timeoutMs) <= 0) {
+        return 0;
+    }
+    return ((fds[0].revents & (POLLIN | POLLHUP | POLLERR)) ? 1 : 0) |
+           ((fds[1].revents & (POLLIN | POLLHUP | POLLERR)) ? 2 : 0);
+#endif
+}
+
+void SendAll(SocketHandle sock, const std::string& data) {
+#ifdef MSG_NOSIGNAL
+    constexpr int flags = MSG_NOSIGNAL;
+#else
+    constexpr int flags = 0;
+#endif
+    size_t sent = 0;
+    while (sent < data.size()) {
+        auto n = send(sock, data.data() + sent, static_cast<int>(data.size() - sent), flags);
+        if (n <= 0) {
+            return;
+        }
+        sent += static_cast<size_t>(n);
+    }
+}
+
+sockaddr_in LoopbackAddress(uint16_t port) {
+    sockaddr_in addr{};
+    addr.sin_family = AF_INET;
+    addr.sin_addr.s_addr = htonl(INADDR_LOOPBACK);
+    addr.sin_port = htons(port);
+    return addr;
+}
+
+void PushCommand(json cmd) {
+    std::lock_guard<std::mutex> lock(gQueueMutex);
+    if (gCommandQueue.size() >= kMaxQueueSize) {
+        SPDLOG_WARN("[HiveShock] command queue full ({}), rejecting the new command", kMaxQueueSize);
+        return;
+    }
+    gCommandQueue.push_back(std::move(cmd));
+}
+
+// Puts back a command that was just popped, so it always fits (the size cap only applies to new arrivals).
+void PushCommandFront(json cmd) {
+    std::lock_guard<std::mutex> lock(gQueueMutex);
+    gCommandQueue.push_front(std::move(cmd));
+}
+
+bool PopCommand(json& out) {
+    std::lock_guard<std::mutex> lock(gQueueMutex);
+    if (gCommandQueue.empty()) {
+        return false;
+    }
+    out = std::move(gCommandQueue.front());
+    gCommandQueue.pop_front();
+    return true;
+}
+
+void ClearCommandQueue() {
+    std::lock_guard<std::mutex> lock(gQueueMutex);
+    gCommandQueue.clear();
+}
+
+ApplyResult FromGi(GameInteractionEffectQueryResult result) {
+    if (result == GameInteractionEffectQueryResult::Possible) {
+        return ApplyResult::Applied;
+    }
+    if (result == GameInteractionEffectQueryResult::TemporarilyNotPossible) {
+        return ApplyResult::Deferred;
+    }
+    return ApplyResult::Skipped;
+}
+
+bool IsSceneChangeInProgress() {
+    if (gPlayState == nullptr) {
+        return true;
+    }
+    if (gPlayState->transitionTrigger != TRANS_TRIGGER_OFF) {
+        return true;
+    }
+    if (gPlayState->transitionMode != TRANS_MODE_OFF) {
+        return true;
+    }
+    Player* player = GET_PLAYER(gPlayState);
+    if (player != nullptr && (player->stateFlags1 & PLAYER_STATE1_DEAD)) {
+        return true;
+    }
+    return false;
+}
+
+// GameInteractor::CanSpawnActor() already covers pause menu, NPC dialogue (msgCtx.msgMode)
+// and blocking cutscenes (Player_InBlockingCsMode) via IsGameplayPaused(). Every command
+// needs this check, not just spawns/"dangerous" actions: effects like speed/invert/
+// invincible/haste/warp/time_skip/magic/rupees used to skip it entirely and fire straight
+// into a frame where the player-update code that would apply them never runs, so they were
+// silently lost instead of deferred-and-retried like everything else.
+bool ShouldDeferEffects() {
+    return !GameInteractor::CanSpawnActor() || IsSceneChangeInProgress();
+}
+
+// Why the command at the front of the queue cannot run yet, for the log. A deferred command is otherwise silent.
+const char* DeferReason() {
+    if (gPlayState == nullptr) {
+        return "no scene loaded (title screen / file select)";
+    }
+    if (IsSceneChangeInProgress()) {
+        return "scene change in progress or Link is dead";
+    }
+    if (!GameInteractor::CanSpawnActor()) {
+        return "Link is not in control (cutscene, menu, text box or paused)";
+    }
+    return "waiting for a safe moment";
+}
+
+// The desktop spawn code calls this name; on Android CanSpawnActor() already covers "Link is in control".
+bool ShouldDeferDangerousEffects() {
+    return ShouldDeferEffects();
+}
+
+void ActivateBuff(BridgeBuff buff, float durationSeconds, f32 strength) {
+    durationSeconds = std::clamp(durationSeconds, 1.0f, 120.0f);
+    BuffState& state = gBuffs[static_cast<size_t>(buff)];
+    state.active = true;
+    state.until =
+        Clock::now() + std::chrono::duration_cast<Clock::duration>(std::chrono::duration<float>(durationSeconds));
+    state.strength = strength;
+    SPDLOG_INFO("[HiveShock] buff '{}' {:.1f}s (strength={:.2f})", BuffName(buff), durationSeconds, strength);
+}
+
+void ClearExpiredBuffs() {
+    const auto now = Clock::now();
+    for (size_t i = 0; i < static_cast<size_t>(BridgeBuff::Count); i++) {
+        if (gBuffs[i].active && now >= gBuffs[i].until) {
+            BridgeBuff buff = static_cast<BridgeBuff>(i);
+            gBuffs[i].active = false;
+            if (buff == BridgeBuff::Speed) {
+                GameInteractor::State::MovementSpeedMultiplier = 1.0f;
+            }
+            if (buff == BridgeBuff::Invincible) {
+                GameInteractor::RawAction::SetPlayerInvincibility(false);
+            }
+            SPDLOG_INFO("[HiveShock] buff '{}' ended", BuffName(buff));
+        }
+    }
+}
+
+float BuffDurationFromCmd(const json& cmd) {
+    float duration = GetDuration(cmd);
+    if (duration <= 0.0f) {
+        duration = kDefaultBuffSeconds;
+    }
+    return duration;
+}
+
+void TickInfiniteMagic() {
+    if (!IsBuffActive(BridgeBuff::InfiniteMagic) || !gSaveContext.isMagicAcquired) {
+        return;
+    }
+    int8_t cap = static_cast<int8_t>((gSaveContext.isDoubleMagicAcquired + 1) * MAGIC_NORMAL_METER);
+    gSaveContext.magic = cap;
+}
+
+void TickInvincible() {
+    if (IsBuffActive(BridgeBuff::Invincible) && gPlayState != nullptr) {
+        GameInteractor::RawAction::SetPlayerInvincibility(true);
+    }
+}
+
+void ResumeTime() {
+    if (gSavedTimeSpeed != 0) {
+        gTimeIncrement = gSavedTimeSpeed;
+    } else if (gPlayState != nullptr && gPlayState->envCtx.timeIncrement != 0) {
+        gTimeIncrement = gPlayState->envCtx.timeIncrement;
+    } else {
+        gTimeIncrement = 1;
+    }
+    gTimeIsFrozen = false;
+    gTimeFreezeHasDeadline = false;
+    SPDLOG_INFO("[HiveShock] time resumed (gTimeIncrement={})", (int)gTimeIncrement);
+}
+
+void FreezeTime(float durationSeconds) {
+    if (!gTimeIsFrozen) {
+        gSavedTimeSpeed = gTimeIncrement;
+    }
+    gTimeIncrement = 0;
+    gTimeIsFrozen = true;
+    if (durationSeconds > 0.0f) {
+        gTimeFrozenUntil =
+            Clock::now() + std::chrono::duration_cast<Clock::duration>(std::chrono::duration<float>(durationSeconds));
+        gTimeFreezeHasDeadline = true;
+        SPDLOG_INFO("[HiveShock] time frozen for {:.1f}s", durationSeconds);
+    } else {
+        gTimeFreezeHasDeadline = false;
+        SPDLOG_INFO("[HiveShock] time frozen until resume_time");
+    }
+}
+
+// Sends one JSON line to the companion's event port. Fire-and-forget on a short-lived thread.
+void SendEventToBridge(const json& event) {
+    std::string line = event.dump() + "\n";
+    std::thread([line = std::move(line)]() {
+        [[maybe_unused]] NetSession session; // WSAStartup/WSACleanup on Windows, no-op elsewhere
+        SocketHandle sock = socket(AF_INET, SOCK_STREAM, 0);
+        if (sock == kInvalidSocket) {
+            return;
+        }
+        ConfigureSocket(sock);
+        SetNonBlocking(sock, true);
+
+        sockaddr_in addr = LoopbackAddress(kEventPort);
+        int result = connect(sock, reinterpret_cast<sockaddr*>(&addr), sizeof(addr));
+        if (result != 0 && !ConnectInProgress()) {
+            CloseSocket(sock);
+            return;
+        }
+        if (result != 0 && !WaitForSocket(sock, false, 200)) {
+            CloseSocket(sock);
+            return;
+        }
+        int soError = 0;
+        socklen_t soLen = sizeof(soError);
+        if (getsockopt(sock, SOL_SOCKET, SO_ERROR, reinterpret_cast<char*>(&soError), &soLen) != 0 || soError != 0) {
+            CloseSocket(sock);
+            return;
+        }
+
+        SetNonBlocking(sock, false);
+        SendAll(sock, line);
+        CloseSocket(sock);
+    }).detach();
+}
+
+void NotifyDeathCount() {
+    json event = { { "event", "player_death" }, { "deaths", gDeathCount.load() } };
+    SendEventToBridge(event);
+}
+
+void NotifyDeathsReset(const char* reason) {
+    json event = { { "event", reason }, { "deaths", 0 } };
+    SendEventToBridge(event);
+}
+
+void RegisterDeath(const char* reason) {
+    int deaths = ++gDeathCount;
+    gDeathCountedThisCycle = true;
+    SPDLOG_INFO("[HiveShock] {} #{}", reason, deaths);
+    NotifyDeathCount();
+}
+
+void ClampMinHealthAfterHit() {
+    if (gSaveContext.health < kMinHealthAfterDamage) {
+        gSaveContext.health = kMinHealthAfterDamage;
+    }
+}
+
+std::string TruncateDonorName(const std::string& user) {
+    if (user.empty()) {
+        return "";
+    }
+    std::string out;
+    out.reserve(kMaxNameTagChars);
+    for (unsigned char c : user) {
+        if (out.size() >= kMaxNameTagChars) {
+            break;
+        }
+        if (c >= 32 && c < 127) {
+            out.push_back(static_cast<char>(c));
+        }
+    }
+    return out;
+}
+
+std::string NormalizeActionName(std::string name) {
+    std::string out;
+    out.reserve(name.size());
+    for (unsigned char c : name) {
+        if (c >= 'A' && c <= 'Z') {
+            out.push_back(static_cast<char>(c - 'A' + 'a'));
+        } else if (c == '-' || c == ' ') {
+            out.push_back('_');
+        } else if ((c >= 'a' && c <= 'z') || (c >= '0' && c <= '9') || c == '_') {
+            out.push_back(static_cast<char>(c));
+        }
+    }
+    // Common companion aliases that do not match the table name 1:1.
+    if (out == "likelike" || out == "like") {
+        return "like_like";
+    }
+    if (out == "darklink" || out == "shadowlink" || out == "shadow_link") {
+        return "dark_link";
+    }
+    if (out == "ironknuckle" || out == "knuckle") {
+        return "iron_knuckle";
+    }
+    if (out == "firekeese") {
+        return "fire_keese";
+    }
+    if (out == "icekeese") {
+        return "ice_keese";
+    }
+    if (out == "whitewolfos") {
+        return "white_wolfos";
+    }
+    if (out == "bluetektite") {
+        return "blue_tektite";
+    }
+    if (out == "twinrova") {
+        return "birova";
+    }
+    // "búho": the accent is dropped above, so it arrives as "bho".
+    if (out == "cucco_normal" || out == "normal_cucco" || out == "calm_cucco" || out == "cuccocalm") {
+        return "cucco_calm";
+    }
+    if (out == "kaepora" || out == "buho" || out == "bho" || out == "kaepora_gaebora") {
+        return "owl";
+    }
+    if (out == "midoblock" || out == "mido_block") {
+        return "mido";
+    }
+    if (out == "randomenemy" || out == "random") {
+        return "random_enemy";
+    }
+    if (out == "cuccoarmy" || out == "cuccostorm" || out == "cucco_storm") {
+        return "cucco_army";
+    }
+    return out;
+}
+
+const SpawnDef* FindSpawnDef(const std::string& name) {
+    std::string key = NormalizeActionName(name);
+    if (key.rfind("spawn_", 0) == 0) {
+        key = key.substr(6);
+    }
+    for (const SpawnDef& def : kSpawnTable) {
+        if (key == def.name) {
+            return &def;
+        }
+    }
+    return nullptr;
+}
+
+bool IsPestName(const std::string& name) {
+    return name == "owl" || name == "mido";
+}
+
+bool IsCalmCucco(const SpawnDef& def) {
+    return def.actorId == ACTOR_EN_NIW && std::string(def.name) == "cucco_calm";
+}
+
+bool IsTrackedSpawnName(const std::string& name) {
+    return name != "fairy" && name != "navi" && name != "bombchu" && name != "cucco_calm" && !IsPestName(name);
+}
+
+bool ActorStillLoaded(Actor* actor) {
+    if (actor == nullptr || actor->update == nullptr || gPlayState == nullptr) {
+        return false;
+    }
+    if (actor->category >= ACTORCAT_MAX) {
+        return false;
+    }
+    for (Actor* it = gPlayState->actorCtx.actorLists[actor->category].head; it != nullptr; it = it->next) {
+        if (it == actor) {
+            return true;
+        }
+    }
+    return false;
+}
+
+bool TrackedStillLoaded(const TrackedEnemy& t);
+
+// Enemies in the scene, the game's own included. The bosses HiveShock injected live in the boss list, so they are added
+// on top: they take the same room as any other enemy.
+s32 CountSceneEnemies() {
+    if (gPlayState == nullptr) {
+        return 0;
+    }
+    s32 count = gPlayState->actorCtx.actorLists[ACTORCAT_ENEMY].length;
+    for (const TrackedEnemy& t : gTrackedEnemies) {
+        if (t.actor != nullptr && t.actor->category == ACTORCAT_BOSS && TrackedStillLoaded(t)) {
+            count++;
+        }
+    }
+    return count;
+}
+
+s64 UnixNow() {
+    return static_cast<s64>(std::time(nullptr));
+}
+
+// Puts a spawn back at the FRONT of the backlog, e.g. an enemy that was alive when the scene changed: the viewer's
+// gift follows Link instead of being lost. It bypasses the backlog size cap on purpose.
+void RequeueFront(const TrackedEnemy& enemy) {
+    if (enemy.def == nullptr) {
+        return;
+    }
+    PendingSpawn pending;
+    pending.name = enemy.def->name;
+    pending.user = enemy.user;
+    pending.earliestTick = gTick;
+    pending.createdAt = UnixNow();
+    pending.requeued = true;
+    gPendingSpawns.push_front(std::move(pending));
+    gBacklogDirty = true;
+}
+
+// Requeues the given survivors keeping their original order (oldest ends up first).
+void RequeueSurvivors(const std::vector<TrackedEnemy>& survivors) {
+    for (auto it = survivors.rbegin(); it != survivors.rend(); ++it) {
+        RequeueFront(*it);
+    }
+    if (!survivors.empty()) {
+        SPDLOG_INFO("[HiveShock] {} enemies survived a scene/room change, queued again", survivors.size());
+    }
+}
+
+// The bosses taken from the vanilla game. Their parts are separate actors that must keep their update order, so they
+// are never moved in the actor list or relocated. Ganondorf and Ganon keep their file-level state in a slot each, so
+// several of them can exist at once; Barinade has no slots yet and stays one at a time.
+bool IsHiveBoss(s16 actorId) {
+    return actorId == ACTOR_BOSS_VA || actorId == ACTOR_BOSS_GANON || actorId == ACTOR_BOSS_GANON2 ||
+           actorId == ACTOR_BOSS_TW;
+}
+
+bool TrackedStillLoaded(const TrackedEnemy& t) {
+    // The id check guards against a freed actor whose memory was reused by a different one.
+    return ActorStillLoaded(t.actor) && t.def != nullptr && t.actor->id == t.def->actorId;
+}
+
+// Kills the tracked actor and any actors linked to it. The id check guards against freed memory reused by another actor.
+void KillTrackedGroup(const TrackedEnemy& t) {
+    if (TrackedStillLoaded(t)) {
+        KillTrackedActor(t.actor);
+    }
+    for (Actor* linked : { t.linkedA, t.linkedB }) {
+        if (ActorStillLoaded(linked) && linked->id == ACTOR_EN_FLOORMAS) {
+            Actor_Kill(linked);
+        }
+    }
+}
+
+// Drops enemies that are gone. A normal death just disappears; but right after a room change an enemy that vanishes
+// while still alive was removed by the room swap, so it is requeued rather than lost. Only call this from the
+// per-frame update (never while the backlog is being iterated).
+void PruneTrackedEnemies() {
+    std::vector<TrackedEnemy> survivors;
+    const bool inRoomGrace = gTick < gRoomGraceUntilTick;
+    for (auto it = gTrackedEnemies.begin(); it != gTrackedEnemies.end();) {
+        if (TrackedStillLoaded(*it)) {
+            ++it;
+            continue;
+        }
+        if (inRoomGrace && it->alive) {
+            survivors.push_back(std::move(*it));
+        } else {
+            gStatDefeated++;
+        }
+        it = gTrackedEnemies.erase(it);
+    }
+    RequeueSurvivors(survivors);
+}
+
+size_t CountLiveTrackedEnemies() {
+    return gTrackedEnemies.size();
+}
+
+s32 GetMaxAlive() {
+    return std::max(1, CVarGetInteger(CVAR_REMOTE_HIVESHOCK("MaxAlive"), kDefaultMaxAlive) * gBudgetPercent.load() / 100);
+}
+
+s32 GetMaxSceneEnemies() {
+    return std::max(1, CVarGetInteger(CVAR_REMOTE_HIVESHOCK("MaxSceneEnemies"), kDefaultMaxSceneEnemies) * gBudgetPercent.load() / 100);
+}
+
+s32 GetMaxLoad() {
+    return std::max(1, CVarGetInteger(CVAR_REMOTE_HIVESHOCK("MaxLoad"), kDefaultMaxLoad) * gBudgetPercent.load() / 100);
+}
+
+// Budget used by the injected enemies that are still alive.
+s32 CurrentLoad() {
+    s32 load = 0;
+    for (const TrackedEnemy& t : gTrackedEnemies) {
+        load += t.weight;
+    }
+    return load;
+}
+
+s32 GetEliteReserve() {
+    return std::clamp(CVarGetInteger(CVAR_REMOTE_HIVESHOCK("EliteReserve"), kDefaultEliteReserve), 0, kMaxEliteReserve);
+}
+
+HiveShockAdmission::Lane LaneOf(const SpawnDef& def) {
+    return def.weight >= kEliteWeight ? HiveShockAdmission::Lane::Elite : HiveShockAdmission::Lane::Ordinary;
+}
+
+HiveShockAdmission::Config AdmissionConfig() {
+    return { GetMaxLoad(), GetEliteReserve(), kOrdinaryFloor };
+}
+
+// Load of the live injected enemies split by lane (see HiveShockAdmission.h).
+HiveShockAdmission::Loads CurrentLoads() {
+    HiveShockAdmission::Loads loads{ 0, 0 };
+    for (const TrackedEnemy& t : gTrackedEnemies) {
+        if (t.def != nullptr && t.def->weight >= kEliteWeight) {
+            loads.elite += t.weight;
+        } else {
+            loads.ordinary += t.weight;
+        }
+    }
+    return loads;
+}
+
+// Why one more enemy of this kind cannot enter right now, or nullptr if it fits. Nothing is ever killed to make room:
+// if it does not fit, the spawn simply waits until something dies. Elite enemies have their own bank (and a few
+// reserved slots under the headcount caps), so ordinary enemies filling the pool never block them.
+const char* NoRoomReason(const SpawnDef& def) {
+    if (!IsTrackedSpawnName(def.name)) {
+        return CountSceneEnemies() < GetMaxSceneEnemies() ? nullptr : "the scene has too many enemies";
+    }
+    const HiveShockAdmission::Lane lane = LaneOf(def);
+    const HiveShockAdmission::Config config = AdmissionConfig();
+    const s32 eliteSlots = HiveShockAdmission::EliteSlots(config.eliteReserve, kEliteWeight);
+    if (!HiveShockAdmission::CanAdmitSlots(lane, static_cast<s32>(CountLiveTrackedEnemies()), CountSceneEnemies(),
+                                           GetMaxAlive(), GetMaxSceneEnemies(), eliteSlots)) {
+        return "too many enemies alive or in the scene";
+    }
+    if (!HiveShockAdmission::CanAdmit(lane, def.weight, CurrentLoads(), config)) {
+        return lane == HiveShockAdmission::Lane::Elite ? "the elite bank and the free room in the pool are full"
+                                                       : "the load limit is reached";
+    }
+    return nullptr;
+}
+
+void TrackBridgeEnemy(Actor* actor, const SpawnDef& def, const std::string& user) {
+    if (actor == nullptr) {
+        return;
+    }
+    TrackedEnemy tracked;
+    tracked.actor = actor;
+    tracked.def = &def;
+    tracked.user = user;
+    tracked.spawnTick = gTick;
+    tracked.weight = def.weight;
+    // The "big" Floormaster spawns two small Floormasters of its own during Init and links all three together via
+    // parent/child (see EnFloormas_Init).
+    if (actor->id == ACTOR_EN_FLOORMAS) {
+        tracked.linkedA = actor->parent;
+        tracked.linkedB = actor->child;
+    }
+    gTrackedEnemies.push_back(std::move(tracked));
+}
+
+// How long a pest stays, in game ticks (20 per second). Mido is a fixed 30 s; Kaepora leaves by himself after the talk,
+// so his limit only covers the case where the talk never starts (Link swimming, in the air or targeting something).
+constexpr u32 kMidoStayTicks = 30 * 20;
+constexpr u32 kOwlStayTicks = 90 * 20;
+
+void TrackPest(Actor* actor, const SpawnDef& def) {
+    if (actor == nullptr) {
+        return;
+    }
+    PestState pest;
+    pest.actor = actor;
+    pest.def = &def;
+    pest.expireTick = gTick + (def.actorId == ACTOR_EN_MD ? kMidoStayTicks : kOwlStayTicks);
+    gPests.push_back(pest);
+}
+
+// Whether Link is in the middle of a talk or of a cutscene action started by one (Kaepora's farewell). Killing the
+// other party then would leave Link stuck in it.
+bool LinkIsTalking() {
+    if (gPlayState == nullptr) {
+        return false;
+    }
+    Player* player = GET_PLAYER(gPlayState);
+    return gPlayState->msgCtx.msgMode != 0 ||
+           (player != nullptr && (player->stateFlags1 & (PLAYER_STATE1_TALKING | PLAYER_STATE1_IN_CUTSCENE)) != 0);
+}
+
+// Per-frame upkeep of the pests: forget the ones that are gone and send away the ones whose time is up, never in the
+// middle of a talk.
+void UpdatePests() {
+    for (auto it = gPests.begin(); it != gPests.end();) {
+        if (it->def == nullptr || !ActorStillLoaded(it->actor) || it->actor->id != it->def->actorId) {
+            it = gPests.erase(it);
+            continue;
+        }
+        if (gTick >= it->expireTick && !LinkIsTalking()) {
+            KillTrackedActor(it->actor);
+            it = gPests.erase(it);
+            continue;
+        }
+        ++it;
+    }
+}
+
+// Explicit streamer action: kills the live injected enemies. Spawns still waiting in the backlog are untouched.
+void ClearBridgeEnemies() {
+    for (TrackedEnemy& t : gTrackedEnemies) {
+        KillTrackedGroup(t);
+        gStatDefeated++;
+    }
+    gTrackedEnemies.clear();
+    SPDLOG_INFO("[HiveShock] cleared bridge enemies");
+}
+
+// Removes the injected enemies that are still alive and counts them as defeated, so they are not queued again by a
+// scene reload and the spawns still waiting simply carry on. Used when Link dies ("Defeat alive enemies when Link
+// dies") and on a zone change ("Enemies disappear on zone change"); both are options the player turns on.
+void DefeatAliveEnemies(const char* reason) {
+    int defeated = 0;
+    for (TrackedEnemy& t : gTrackedEnemies) {
+        KillTrackedGroup(t);
+        gStatDefeated++;
+        defeated++;
+    }
+    gTrackedEnemies.clear();
+    if (defeated > 0) {
+        SPDLOG_INFO("[HiveShock] {}: {} alive enemies marked as defeated", reason, defeated);
+    }
+}
+
+// Explicit streamer action: forgets the spawns that are still waiting.
+void ClearPendingSpawns() {
+    SPDLOG_INFO("[HiveShock] cleared {} pending spawns", gPendingSpawns.size());
+    gPendingSpawns.clear();
+    gBacklogDirty = true;
+}
+
+// The scene is going away (or we are at the title screen): everything injected that was still alive is queued again
+// so it reappears next to Link, and the tracking starts clean. Does not touch the old actor pointers. With
+// "Enemies disappear on zone change" they are not queued again: they are left behind and counted as defeated.
+void ResetBridgeActorTracking() {
+    gPests.clear(); // passing effects: they are left behind with the scene, never queued again
+    for (NaviState& navi : gNavis) {
+        navi.actor = nullptr; // the old one is gone with the scene; UpdateNavis invokes her again beside Link
+    }
+    if (CVarGetInteger(CVAR_REMOTE_HIVESHOCK("DespawnOnZoneChange"), 0)) {
+        if (!gTrackedEnemies.empty()) {
+            gStatDefeated += static_cast<int>(gTrackedEnemies.size());
+            SPDLOG_INFO("[HiveShock] scene change: {} alive enemies left behind, marked as defeated",
+                        gTrackedEnemies.size());
+            gTrackedEnemies.clear();
+        }
+        return;
+    }
+    std::vector<TrackedEnemy> survivors;
+    for (TrackedEnemy& t : gTrackedEnemies) {
+        if (t.alive) {
+            survivors.push_back(std::move(t));
+        }
+    }
+    gTrackedEnemies.clear();
+    RequeueSurvivors(survivors);
+}
+
+// Returns false only if the backlog is full, in which case the new spawn is rejected (older ones are kept).
+bool EnqueueEnemySpawn(std::string name, std::string user, u32 delayTicks) {
+    const bool counted = IsTrackedSpawnName(name);
+    if (gPendingSpawns.size() >= kMaxPendingSpawns) {
+        SPDLOG_WARN("[HiveShock] spawn backlog full ({}), rejecting '{}'", kMaxPendingSpawns, name);
+        SendEventToBridge({ { "event", "spawn_rejected" }, { "action", name }, { "user", user } });
+        return false;
+    }
+    PendingSpawn pending;
+    pending.name = std::move(name);
+    pending.user = std::move(user);
+    pending.earliestTick = gTick + delayTicks;
+    pending.createdAt = UnixNow();
+    gPendingSpawns.push_back(std::move(pending));
+    gBacklogDirty = true;
+    if (counted) {
+        gStatTotal++;
+    }
+    return true;
+}
+
+// Whether Barinade (any part of him) is in the scene.
+bool IsBarinadeInScene() {
+    for (Actor* it = gPlayState->actorCtx.actorLists[ACTORCAT_BOSS].head; it != nullptr; it = it->next) {
+        if (it->id == ACTOR_BOSS_VA) {
+            return true;
+        }
+    }
+    return false;
+}
+
+// Whether Twinrova (or her sisters, or a blast of hers) is in the scene.
+bool IsTwinrovaInScene() {
+    for (Actor* it = gPlayState->actorCtx.actorLists[ACTORCAT_BOSS].head; it != nullptr; it = it->next) {
+        if (it->id == ACTOR_BOSS_TW) {
+            return true;
+        }
+    }
+    return false;
+}
+
+// Whether a Ganondorf or a beast is in the scene. Only the bodies count: the energy balls and lightning Ganondorf
+// throws are BOSS_GANON actors too, and must not make the scene look occupied.
+bool IsGanonInScene() {
+    for (Actor* it = gPlayState->actorCtx.actorLists[ACTORCAT_BOSS].head; it != nullptr; it = it->next) {
+        if (it->id == ACTOR_BOSS_GANON2 || (it->id == ACTOR_BOSS_GANON && it->params < 0x64)) {
+            return true;
+        }
+    }
+    return false;
+}
+
+// How many live injected enemies of this kind there are.
+s32 CountTrackedOfKind(s16 actorId) {
+    s32 count = 0;
+    for (const TrackedEnemy& t : gTrackedEnemies) {
+        if (t.def != nullptr && t.def->actorId == actorId) {
+            count++;
+        }
+    }
+    return count;
+}
+
+// True when `root` is somewhere up the parent chain of `actor`. The walk is bounded in case of a bad link.
+bool IsDescendantOf(const Actor* actor, const Actor* root) {
+    const Actor* it = actor->parent;
+    for (int depth = 0; it != nullptr && depth < 8; depth++, it = it->parent) {
+        if (it == root) {
+            return true;
+        }
+    }
+    return false;
+}
+
+// Kills one actor. A grabber (a Dead Hand's hand, for one) keeps Link held through player->actor.parent and only lets
+// go from its own update, which never runs again once it is killed: Link would stay stuck to an actor that is gone.
+// So he is released first, the same way the hand does it.
+void KillActorReleasingLink(Actor* victim) {
+    Player* player = GET_PLAYER(gPlayState);
+    if (player != nullptr && player->actor.parent == victim) {
+        player->stateFlags2 &= ~PLAYER_STATE2_GRABBED_BY_ENEMY;
+        player->actor.parent = nullptr;
+        player->av2.actionVar2 = 200;
+    }
+    Actor_Kill(victim);
+}
+
+// Removes an injected enemy. Barinade is made of many actors that point at the body: killing only the body would
+// leave the others running with a dangling parent, so a Barinade is always removed whole. The same goes for anything
+// that has the enemy as its parent: Ganondorf's cape and energy balls, a Dead Hand's hands. They are separate actors
+// that draw themselves and would stay on screen until the body's Destroy ran (which waits while Link is dead or the
+// actors are frozen), so the whole tree goes at once.
+void KillTrackedActor(Actor* actor) {
+    if (actor->id == ACTOR_BOSS_VA || actor->id == ACTOR_BOSS_TW) {
+        // Twinrova's sisters point at each other, not at her, so her tree cannot be found by parent either.
+        for (Actor* it = gPlayState->actorCtx.actorLists[ACTORCAT_BOSS].head; it != nullptr; it = it->next) {
+            if (it->id == actor->id) {
+                KillActorReleasingLink(it);
+            }
+        }
+        return;
+    }
+    for (int category = 0; category < ACTORCAT_MAX; category++) {
+        if (category == ACTORCAT_PLAYER) {
+            continue; // Link has whatever grabbed him as his parent; he is not part of its tree
+        }
+        for (Actor* it = gPlayState->actorCtx.actorLists[category].head; it != nullptr; it = it->next) {
+            if (it != actor && IsDescendantOf(it, actor)) {
+                KillActorReleasingLink(it);
+            }
+        }
+    }
+    KillActorReleasingLink(actor);
+}
+
+Actor* SpawnActorInAnyRoom(s16 actorId, f32 x, f32 y, f32 z, s16 rotX, s16 rotY, s16 rotZ, s32 params) {
+    // Actor_Spawn refuses enemies in a cleared room, so drop the flag for the duration of the call. The bit is
+    // toggled directly (not via Flags_Set/UnsetClear) so no scene-flag hooks fire: the randomizer tracker and
+    // similar listeners must not see a fake "room cleared" event for every spawn.
+    s32 roomNum = gPlayState->roomCtx.curRoom.num;
+    const bool roomInRange = roomNum >= 0 && roomNum < 32;
+    const u32 roomBit = roomInRange ? (1u << roomNum) : 0;
+    const bool wasCleared = roomInRange && (gPlayState->actorCtx.flags.clear & roomBit) != 0;
+    if (wasCleared) {
+        gPlayState->actorCtx.flags.clear &= ~roomBit;
+    }
+
+    gHiveShockBossSpawn = IsHiveBoss(actorId);
+    gPestSpawning = actorId == ACTOR_EN_MD;
+    Actor* spawned = Actor_Spawn(&gPlayState->actorCtx, gPlayState, actorId, x, y, z, rotX, rotY, rotZ, params);
+    gPestSpawning = false;
+    gHiveShockBossSpawn = 0;
+
+    if (wasCleared) {
+        gPlayState->actorCtx.flags.clear |= roomBit;
+    }
+    return spawned;
+}
+
+// Why this spawn cannot happen where Link is, or nullptr if it can. The reason goes to the log: a held spawn is
+// otherwise silent.
+// Whether a pest of this kind (a Kaepora or a Mido) is still around.
+bool IsPestInScene(s16 actorId) {
+    for (const PestState& pest : gPests) {
+        if (pest.def != nullptr && pest.def->actorId == actorId && ActorStillLoaded(pest.actor) &&
+            pest.actor->id == actorId) {
+            return true;
+        }
+    }
+    return false;
+}
+
+const char* SceneBlockReason(const SpawnDef& def) {
+    int16_t sceneNum = gPlayState->sceneNum;
+    int16_t roomNum = gPlayState->roomCtx.curRoom.num;
+
+    // Only one Kaepora at a time (his talks would overlap); any number of Midos.
+    if (def.actorId == ACTOR_EN_OWL && IsPestInScene(def.actorId)) {
+        return "Kaepora is already in the scene";
+    }
+    if (IsCalmCucco(def)) {
+        // Calm cuccos stay until the scene changes, so they are capped instead of piling up.
+        constexpr s32 kMaxCalmCuccos = 15;
+        s32 cuccos = 0;
+        for (Actor* it = gPlayState->actorCtx.actorLists[ACTORCAT_PROP].head; it != nullptr; it = it->next) {
+            cuccos += it->id == ACTOR_EN_NIW ? 1 : 0;
+        }
+        if (cuccos >= kMaxCalmCuccos) {
+            return "too many cuccos in the scene";
+        }
+    }
+
+    if (sceneNum == SCENE_FOREST_TEMPLE && (roomNum == 12 || roomNum == 13 || roomNum == 16)) {
+        return "this Forest Temple room does not take extra enemies";
+    }
+    if (def.actorId == ACTOR_BOSS_VA) {
+        // Not in Jabu-Jabu's boss room (the real Barinade shares its state), and one at a time: his many parts keep
+        // their state in file-level variables. He does not share the stage with Ganondorf or Ganon either (their
+        // effect pools and cameras are not meant to run together with his).
+        if (sceneNum == SCENE_JABU_JABU_BOSS) {
+            return "the real Barinade fight lives in this scene";
+        }
+        if (IsBarinadeInScene()) {
+            return "Barinade is already in the scene";
+        }
+        if (IsGanonInScene()) {
+            return "Ganondorf or Ganon is in the scene";
+        }
+        if (IsTwinrovaInScene()) {
+            return "Birova is in the scene";
+        }
+    }
+    if (def.actorId == ACTOR_BOSS_TW) {
+        // One at a time, and not together with the other bosses: her blasts, her effect pool and her light flashes
+        // are shared state, like Barinade's.
+        if (sceneNum == SCENE_SPIRIT_TEMPLE_BOSS) {
+            return "the real Birova fight lives in this scene";
+        }
+        if (IsTwinrovaInScene()) {
+            return "Birova is already in the scene";
+        }
+        if (IsBarinadeInScene() || IsGanonInScene()) {
+            return "another boss is in the scene";
+        }
+    }
+    if (def.actorId == ACTOR_BOSS_GANON || def.actorId == ACTOR_BOSS_GANON2) {
+        // Not where the real fight lives (it shares the state). Any number of them can share the scene, up to the
+        // slots they have, but not together with Barinade.
+        if (sceneNum == SCENE_GANON_BOSS || sceneNum == SCENE_GANONDORF_BOSS) {
+            return "the real Ganon fight lives in this scene";
+        }
+        if (IsBarinadeInScene()) {
+            return "Barinade is in the scene";
+        }
+        if (IsTwinrovaInScene()) {
+            return "Birova is in the scene";
+        }
+        const s32 limit = def.actorId == ACTOR_BOSS_GANON ? HIVESHOCK_MAX_GANONDORF : HIVESHOCK_MAX_GANON_BEAST;
+        if (CountTrackedOfKind(def.actorId) >= limit) {
+            return "all the Ganondorf / Ganon slots are taken";
+        }
+    }
+    if (def.actorId == ACTOR_EN_CLEAR_TAG) {
+        if (sceneNum == SCENE_DODONGOS_CAVERN_BOSS || sceneNum == SCENE_WATER_TEMPLE_BOSS ||
+            sceneNum == SCENE_SPIRIT_TEMPLE_BOSS || sceneNum == SCENE_GANONDORF_BOSS ||
+            sceneNum == SCENE_FISHING_POND || sceneNum == SCENE_GANON_BOSS) {
+            return "Arwings do not fit in this boss room";
+        }
+    }
+    return nullptr;
+}
+
+// Actors live in one intrusive linked list per category, and Actor_Spawn inserts new ones at the HEAD. Some
+// vanilla enemies find their partner by blindly casting actor.prev / actor.next (the two mini-boss Lizalfos of
+// Dodongo's Cavern do this to hand each other their "attack now" timer). An injected actor at the head becomes the
+// neighbour of the first native one, so that code wrote into the wrong actor and the real partner never got its
+// timer: the Lizalfos stayed frozen even after the injected enemy died. Moving injected actors to the tail keeps
+// the natives' adjacency exactly as the game laid it out.
+void MoveActorToListTail(Actor* actor) {
+    if (actor == nullptr || actor->next == nullptr || actor->category >= ACTORCAT_MAX) {
+        return;
+    }
+    ActorListEntry& list = gPlayState->actorCtx.actorLists[actor->category];
+
+    if (actor->prev != nullptr) {
+        actor->prev->next = actor->next;
+    } else {
+        list.head = actor->next;
+    }
+    actor->next->prev = actor->prev;
+
+    Actor* tail = actor->next;
+    while (tail->next != nullptr) {
+        tail = tail->next;
+    }
+    tail->next = actor;
+    actor->prev = tail;
+    actor->next = nullptr;
+}
+
+// The non-mini-boss Lizalfos/Dinolfos overwrite a static shared with the Dodongo's Cavern mini-boss pair (which of
+// the two is attacking / whether the fight is over) and, when they die, poke their list neighbour as if it were
+// the partner. Injecting one during that fight would end it early or corrupt memory, so hold it until it is over.
+bool IsLizalfosMinibossActive() {
+    for (Actor* it = gPlayState->actorCtx.actorLists[ACTORCAT_ENEMY].head; it != nullptr; it = it->next) {
+        if (it->id == ACTOR_EN_ZF && it->update != nullptr && it->params >= 0 && it->colChkInfo.health > 0) {
+            return true;
+        }
+    }
+    return false;
+}
+
+// Picks a spot on the floor around Link for this enemy (in front of him first). Always fills pos; returns false
+// only if no floor was found at all and Link's own position had to be used.
+bool FindSpawnPosition(const SpawnDef& def, Player* player, Vec3f& pos) {
+    // Try several nearby points. A single raycast into void (indoors / cliffs)
+    // used to return Deferred forever and stall the whole pending spawn queue.
+    pos = player->actor.world.pos;
+    bool foundFloor = false;
+    // How far from Link the enemy appears, in order of preference (the first distance with floor wins; the last
+    // entries are close fallbacks for small rooms). Some enemies only wake up when Link is within a short range
+    // (Stalchild: 60 units, Redead/Gibdo: 150), so they spawn close. The big ones (elite) start a bit further away,
+    // at a fairer distance, and walk up to Link by themselves: they sense him from 200 units or more.
+    static constexpr f32 kRadiiDefault[] = { 80.0f, 120.0f, 40.0f, 160.0f };
+    static constexpr f32 kRadiiStalchild[] = { 45.0f, 35.0f, 50.0f, 30.0f };
+    static constexpr f32 kRadiiRedead[] = { 135.0f, 115.0f, 150.0f, 100.0f, 80.0f };
+    static constexpr f32 kRadiiElite[] = { 200.0f, 240.0f, 160.0f, 280.0f, 120.0f, 80.0f };
+    // Kaepora perches in front of Link, well inside his talking range. Mido is a wall: right in front of Link, close
+    // enough that he cannot walk straight past him, far enough that the two cylinders do not start overlapped.
+    static constexpr f32 kRadiiOwl[] = { 150.0f, 120.0f, 180.0f, 90.0f };
+    static constexpr f32 kRadiiMido[] = { 90.0f, 110.0f, 70.0f, 130.0f };
+    const f32* radii = kRadiiDefault;
+    size_t radiiCount = ARRAY_COUNT(kRadiiDefault);
+    if (def.actorId == ACTOR_EN_SKB) {
+        radii = kRadiiStalchild;
+        radiiCount = ARRAY_COUNT(kRadiiStalchild);
+    } else if (def.actorId == ACTOR_EN_RD || def.actorId == ACTOR_EN_DH) {
+        radii = kRadiiRedead;
+        radiiCount = ARRAY_COUNT(kRadiiRedead);
+    } else if (def.actorId == ACTOR_EN_GOMA) {
+        radii = kRadiiStalchild;
+        radiiCount = ARRAY_COUNT(kRadiiStalchild);
+    } else if (def.actorId == ACTOR_EN_OWL) {
+        radii = kRadiiOwl;
+        radiiCount = ARRAY_COUNT(kRadiiOwl);
+    } else if (def.actorId == ACTOR_EN_MD) {
+        radii = kRadiiMido;
+        radiiCount = ARRAY_COUNT(kRadiiMido);
+    } else if (def.weight >= kEliteWeight) {
+        radii = kRadiiElite;
+        radiiCount = ARRAY_COUNT(kRadiiElite);
+    }
+    const s16 yawBase = player->actor.shape.rot.y; // in front of Link
+    for (size_t r = 0; r < radiiCount && !foundFloor; r++) {
+        const f32 radius = radii[r];
+        for (s32 i = 0; i < 8 && !foundFloor; i++) {
+            s16 yaw = yawBase + (s16)(i * 0x2000);
+            Vec3f candidate;
+            candidate.x = player->actor.world.pos.x + Math_SinS(yaw) * radius;
+            candidate.y = player->actor.world.pos.y + 50.0f;
+            candidate.z = player->actor.world.pos.z + Math_CosS(yaw) * radius;
+
+            CollisionPoly poly;
+            Vec3f rayPos = candidate;
+            f32 floorY = BgCheck_AnyRaycastFloor1(&gPlayState->colCtx, &poly, &rayPos);
+            if (floorY > BGCHECK_Y_MIN) {
+                pos = candidate;
+                pos.y = floorY;
+                foundFloor = true;
+            }
+        }
+    }
+    if (!foundFloor) {
+        // Last resort: spawn at Link's feet so the command still does something.
+        pos = player->actor.world.pos;
+        CollisionPoly poly;
+        Vec3f rayPos = pos;
+        rayPos.y += 50.0f;
+        f32 floorY = BgCheck_AnyRaycastFloor1(&gPlayState->colCtx, &poly, &rayPos);
+        if (floorY > BGCHECK_Y_MIN) {
+            pos.y = floorY;
+        }
+    }
+    if (def.actorId == ACTOR_EN_CLEAR_TAG || def.actorId == ACTOR_EN_FIREFLY || def.actorId == ACTOR_EN_BILI) {
+        pos.y += 100.0f;
+    }
+    if (def.actorId == ACTOR_EN_NIW && !IsCalmCucco(def)) {
+        pos.y = player->actor.world.pos.y + 80.0f; // the angry ones dive at Link from above
+    }
+    // The healing fairy only heals when it floats a little above Link's feet, so do not leave it on the floor.
+    if (def.actorId == ACTOR_EN_ELF) {
+        pos.y += 40.0f;
+    }
+    return foundFloor;
+}
+
+// A Dead Hand's hands are separate actors that the room normally places around it. They grab Link, and when four of
+// them are beaten the Dead Hand comes up. HiveShock puts them on the floor around Link, away from the spot in front
+// of him where the Dead Hand rises, and makes the Dead Hand their parent so they follow its fate (see
+// KillTrackedActor, and EnDha which dies with its parent).
+constexpr s32 kDeadHandHands = 4;
+
+void SpawnDeadHandHands(Actor* deadHand, Player* player) {
+    static constexpr f32 kRadii[] = { 130.0f, 170.0f, 100.0f, 210.0f };
+    const s16 yawBase = player->actor.shape.rot.y;
+    s32 spawnedHands = 0;
+
+    for (s32 hand = 0; hand < kDeadHandHands; hand++) {
+        const s16 yaw = yawBase + static_cast<s16>(0x2000 + hand * 0x4000); // the diagonals around Link
+        for (f32 radius : kRadii) {
+            Vec3f pos = player->actor.world.pos;
+            pos.x += Math_SinS(yaw) * radius;
+            pos.z += Math_CosS(yaw) * radius;
+
+            // A hand stands on the floor: no void and no ledge far below.
+            CollisionPoly poly;
+            Vec3f rayPos = pos;
+            rayPos.y += 50.0f;
+            const f32 floorY = BgCheck_AnyRaycastFloor1(&gPlayState->colCtx, &poly, &rayPos);
+            if (floorY <= BGCHECK_Y_MIN || fabsf(floorY - player->actor.world.pos.y) > 100.0f) {
+                continue;
+            }
+            pos.y = floorY;
+
+            const s16 faceYaw = Math_Vec3f_Yaw(&pos, &player->actor.world.pos);
+            Actor* spawned = SpawnActorInAnyRoom(ACTOR_EN_DHA, pos.x, pos.y, pos.z, 0, faceYaw, 0, 0);
+            if (spawned != nullptr) {
+                spawned->parent = deadHand;
+                spawnedHands++;
+                break;
+            }
+        }
+    }
+    SPDLOG_INFO("[HiveShock] dead_hand: {} of {} hands placed", spawnedHands, kDeadHandHands);
+}
+
+ApplyResult SpawnDefNow(const SpawnDef& def, const std::string& user, const char** whyBlocked = nullptr) {
+    if (gPlayState == nullptr) {
+        return ApplyResult::Deferred;
+    }
+    Player* player = GET_PLAYER(gPlayState);
+    if (player == nullptr) {
+        return ApplyResult::Deferred;
+    }
+    // Not allowed in this place (boss rooms): keep the spawn for when Link is somewhere it works.
+    if (const char* sceneBlock = SceneBlockReason(def)) {
+        if (whyBlocked != nullptr) {
+            *whyBlocked = sceneBlock;
+        }
+        return ApplyResult::Held;
+    }
+    // Room still loading, or a cutscene is running: wait rather than spawn into a half-initialised scene.
+    if (gPlayState->roomCtx.status != 0 || gPlayState->csCtx.state != CS_STATE_IDLE) {
+        return ApplyResult::Deferred;
+    }
+    if (def.actorId == ACTOR_EN_ZF && IsLizalfosMinibossActive()) {
+        if (whyBlocked != nullptr) {
+            *whyBlocked = "the Dodongo's Cavern Lizalfos mini-boss fight is running";
+        }
+        return ApplyResult::Held;
+    }
+    // No room in this lane: wait for an enemy to die instead of removing one.
+    if (const char* noRoom = NoRoomReason(def)) {
+        if (whyBlocked != nullptr) {
+            *whyBlocked = noRoom;
+        }
+        return ApplyResult::LaneFull;
+    }
+
+    Vec3f pos;
+    FindSpawnPosition(def, player, pos);
+    const s16 yawBase = player->actor.shape.rot.y;
+
+    s16 faceYaw = Math_Vec3f_Yaw(&pos, &player->actor.world.pos);
+    Actor* spawned = SpawnActorInAnyRoom(def.actorId, pos.x, pos.y, pos.z, 0, faceYaw, 0, def.params);
+    if (spawned == nullptr) {
+        // Fall back beside Link if the chosen point is invalid for Actor_Spawn.
+        pos = player->actor.world.pos;
+        pos.x += Math_SinS(yawBase) * 40.0f;
+        pos.z += Math_CosS(yawBase) * 40.0f;
+        spawned = SpawnActorInAnyRoom(def.actorId, pos.x, pos.y, pos.z, 0, faceYaw, 0, def.params);
+    }
+    if (spawned == nullptr) {
+        SPDLOG_WARN("[HiveShock] Actor_Spawn({}) returned NULL (actors={})", def.name, gPlayState->actorCtx.total);
+        return ApplyResult::Skipped;
+    }
+
+    // Barinade's parts are spawned as its children in a fixed order, which its update relies on.
+    if (!IsHiveBoss(def.actorId)) {
+        MoveActorToListTail(spawned);
+    }
+
+    spawned->shape.rot.y = faceYaw;
+    spawned->world.rot.y = faceYaw;
+
+    if (def.actorId == ACTOR_EN_NIW && !IsCalmCucco(def)) {
+        reinterpret_cast<EnNiw*>(spawned)->actionFunc = func_80AB70A0_nocutscene;
+    }
+
+    if (def.actorId == ACTOR_EN_DH) {
+        // EnDh_Init buries it at a random spot up to 600 units around home (possibly in a wall or over a void) and
+        // waits for its hands or a bomb to wake it. Put it where it was placed and wake it, so it rises next to Link.
+        spawned->world.pos = pos;
+        spawned->prevPos = pos;
+        spawned->params = ENDH_START_ATTACK_GRAB;
+        SpawnDeadHandHands(spawned, player);
+    }
+
+    if (def.actorId == ACTOR_EN_AM) {
+        // An Armos sleeps until Link touches or hits it. Wake it now; shakeOrigin must be set first because the
+        // waking shake is drawn around it (it is only filled in later by the sleeping state).
+        EnAm* armos = reinterpret_cast<EnAm*>(spawned);
+        armos->shakeOrigin = spawned->world.pos;
+        armos->unk_258 = 1;
+    }
+
+    if (!user.empty() && CVarGetInteger(CVAR_REMOTE_HIVESHOCK("EnemyNameTags"), 1)) {
+        std::string tag = user;
+        if (tag.size() > kMaxNameTagChars) {
+            tag.resize(kMaxNameTagChars);
+        }
+        NameTag_RegisterForActor(spawned, tag.c_str());
+    }
+
+    if (def.actorId == ACTOR_EN_MD) {
+        // Mido blocks the way like he does at the start of the game (EnMd_BlockPath): he keeps 60 units from a fixed
+        // point (home) on the side facing Link, sliding along that circle to stay between Link and the point, so Link
+        // cannot reach it. The point is placed just beyond where he is spawned in front of Link. Several Midos fan out
+        // sideways to make a wider wall. His text is fixed and sets no story flag (see EnMd_GetText), and the walking
+        // away that the story version does when talked to never starts.
+        int others = 0;
+        for (const PestState& pest : gPests) {
+            others += (pest.def != nullptr && pest.def->actorId == ACTOR_EN_MD) ? 1 : 0;
+        }
+        const f32 side = ((others % 2) ? 1.0f : -1.0f) * 50.0f * static_cast<f32>((others + 1) / 2);
+        spawned->world.pos.x += Math_CosS(yawBase) * side;
+        spawned->world.pos.z -= Math_SinS(yawBase) * side;
+        spawned->prevPos = spawned->world.pos;
+
+        f32 dx = spawned->world.pos.x - player->actor.world.pos.x;
+        f32 dz = spawned->world.pos.z - player->actor.world.pos.z;
+        const f32 len = std::max(1.0f, sqrtf(dx * dx + dz * dz));
+        EnMd* mido = reinterpret_cast<EnMd*>(spawned);
+        mido->hiveShock = true;
+        mido->actionFunc = EnMd_BlockPath;
+        mido->actor.home.pos = spawned->world.pos;
+        mido->actor.home.pos.x += dx / len * 60.0f;
+        mido->actor.home.pos.z += dz / len * 60.0f;
+    }
+
+    if (def.actorId == ACTOR_EN_ELF && def.params == FAIRY_NAVI) {
+        if (gNaviRespawnSlot != nullptr) {
+            gNaviRespawnSlot->actor = spawned;
+        } else {
+            gNavis.push_back({ spawned, &def, user });
+        }
+    }
+
+    if (IsTrackedSpawnName(def.name)) {
+        TrackBridgeEnemy(spawned, def, user);
+    } else if (IsPestName(def.name)) {
+        TrackPest(spawned, def);
+    }
+    SPDLOG_INFO("[HiveShock] spawned {} at ({:.1f}, {:.1f}, {:.1f})", def.name, pos.x, pos.y, pos.z);
+    return ApplyResult::Applied;
+}
+
+// Navi goes away only when Link dies (or HiveShock is turned off / the game returns to the title screen).
+void ClearNavis() {
+    for (NaviState& navi : gNavis) {
+        if (navi.actor != nullptr && ActorStillLoaded(navi.actor) && navi.actor->id == ACTOR_EN_ELF) {
+            KillTrackedActor(navi.actor);
+        }
+    }
+    gNavis.clear();
+}
+
+// Keeps every Navi next to Link: after a scene load the old one is gone, so she is invoked again beside him.
+void UpdateNavis() {
+    if (gNavis.empty() || gPlayState == nullptr) {
+        return;
+    }
+    if (gPlayState->gameOverCtx.state != GAMEOVER_INACTIVE) {
+        return;
+    }
+    for (size_t i = 0; i < gNavis.size(); i++) {
+        NaviState& navi = gNavis[i];
+        if (navi.actor != nullptr && ActorStillLoaded(navi.actor) && navi.actor->id == ACTOR_EN_ELF) {
+            continue;
+        }
+        navi.actor = nullptr;
+        if (navi.def == nullptr || ShouldDeferDangerousEffects()) {
+            continue;
+        }
+        gNaviRespawnSlot = &navi;
+        SpawnDefNow(*navi.def, navi.user);
+        gNaviRespawnSlot = nullptr;
+    }
+}
+
+// Moves a stuck enemy next to Link. The enemy is NOT removed, so the viewer's gift keeps fighting.
+void RelocateNearLink(TrackedEnemy& tracked, Player* player) {
+    Vec3f pos;
+    FindSpawnPosition(*tracked.def, player, pos);
+    Actor* actor = tracked.actor;
+    actor->world.pos = pos;
+    actor->prevPos = pos;
+    actor->home.pos = pos;
+    actor->velocity.x = 0.0f;
+    actor->velocity.y = 0.0f;
+    actor->velocity.z = 0.0f;
+    actor->speedXZ = 0.0f;
+    SPDLOG_INFO("[HiveShock] moved stuck {} next to Link", tracked.def->name);
+}
+
+// Per-frame upkeep of the live injected enemies: forget the dead (requeueing the ones lost to a room change), note
+// which are dying, and bring back any that has been left far behind so it cannot hold a budget slot forever.
+void UpdateTrackedEnemies() {
+    PruneTrackedEnemies();
+    if (gTrackedEnemies.empty() || gPlayState == nullptr) {
+        return;
+    }
+    Player* player = GET_PLAYER(gPlayState);
+    const bool checkStuck = player != nullptr && (gTick % kStuckCheckTicks) == 0 && !IsSceneChangeInProgress() &&
+                            gPlayState->roomCtx.status == 0 && gPlayState->csCtx.state == CS_STATE_IDLE;
+
+    for (TrackedEnemy& tracked : gTrackedEnemies) {
+        Actor* actor = tracked.actor;
+        if (actor->colChkInfo.health > 0) {
+            tracked.sawHealth = true;
+        } else if (tracked.sawHealth) {
+            tracked.alive = false;
+        }
+        // Moving only Barinade's body would tear it away from the rest of its parts.
+        if (!checkStuck || !tracked.alive || IsHiveBoss(tracked.def->actorId)) {
+            continue;
+        }
+
+        // Measured from the positions: the cached xzDistToPlayer is only refreshed while the actor updates, which a
+        // culled (far away) enemy does not.
+        const f32 dx = actor->world.pos.x - player->actor.world.pos.x;
+        const f32 dy = actor->world.pos.y - player->actor.world.pos.y;
+        const f32 dz = actor->world.pos.z - player->actor.world.pos.z;
+        const bool tooFar = (dx * dx + dy * dy + dz * dz) > (kStuckDistance * kStuckDistance);
+        if (!tooFar) {
+            tracked.farSinceTick = 0;
+        } else if (tracked.farSinceTick == 0) {
+            tracked.farSinceTick = gTick;
+        } else if (gTick - tracked.farSinceTick >= kStuckTicks) {
+            RelocateNearLink(tracked, player);
+            tracked.farSinceTick = 0;
+        }
+    }
+}
+
+// ---------------------------------------------------------------------------------------------
+// Backlog persistence: the spawns still waiting are mirrored to hiveshock_pending.json (throttled) so a crash or a
+// restart does not lose what viewers paid for. Entries older than kBacklogMaxAgeSeconds are discarded on load.
+// ---------------------------------------------------------------------------------------------
+
+std::filesystem::path BacklogPath() {
+    return std::filesystem::path(Ship::Context::GetPathRelativeToAppDirectory(kBacklogFileName));
+}
+
+void SaveBacklog() {
+    gBacklogDirty = false;
+    gLastBacklogSaveTick = gTick;
+    try {
+        const std::filesystem::path path = BacklogPath();
+        std::error_code ec;
+        if (gPendingSpawns.empty()) {
+            std::filesystem::remove(path, ec);
+            return;
+        }
+        json spawns = json::array();
+        for (const PendingSpawn& pending : gPendingSpawns) {
+            spawns.push_back({ { "name", pending.name }, { "user", pending.user }, { "t", pending.createdAt } });
+        }
+        const json doc = { { "version", 1 }, { "spawns", spawns } };
+
+        // Write to a temp file and rename, so a crash mid-write never leaves a truncated backlog.
+        std::filesystem::path tmp = path;
+        tmp += ".tmp";
+        {
+            std::ofstream out(tmp, std::ios::binary | std::ios::trunc);
+            out << doc.dump();
+            if (!out.good()) {
+                SPDLOG_WARN("[HiveShock] could not write {}", tmp.string());
+                return;
+            }
+        }
+        std::filesystem::rename(tmp, path, ec);
+        if (ec) {
+            SPDLOG_WARN("[HiveShock] could not replace {}: {}", path.string(), ec.message());
+        }
+    } catch (const std::exception& e) { SPDLOG_WARN("[HiveShock] saving the spawn backlog failed: {}", e.what()); }
+}
+
+void LoadBacklog() {
+    gBacklogLoaded = true;
+    try {
+        std::ifstream in(BacklogPath(), std::ios::binary);
+        if (!in.good()) {
+            return;
+        }
+        const json doc = json::parse(in);
+        if (!doc.contains("spawns") || !doc["spawns"].is_array()) {
+            return;
+        }
+        const s64 now = UnixNow();
+        size_t restored = 0;
+        for (const json& entry : doc["spawns"]) {
+            if (gPendingSpawns.size() >= kMaxPendingSpawns || !entry.is_object()) {
+                break;
+            }
+            PendingSpawn pending;
+            pending.name = GetStringField(entry, "name");
+            pending.user = GetStringField(entry, "user");
+            pending.createdAt = entry.contains("t") && entry["t"].is_number_integer() ? entry["t"].get<s64>() : now;
+            if (FindSpawnDef(pending.name) == nullptr || now - pending.createdAt > kBacklogMaxAgeSeconds) {
+                continue;
+            }
+            pending.earliestTick = gTick;
+            if (IsTrackedSpawnName(pending.name)) {
+                gStatTotal++;
+            }
+            gPendingSpawns.push_back(std::move(pending));
+            restored++;
+        }
+        if (restored > 0) {
+            SPDLOG_INFO("[HiveShock] restored {} pending spawns from the previous session", restored);
+        }
+    } catch (const std::exception& e) { SPDLOG_WARN("[HiveShock] loading the spawn backlog failed: {}", e.what()); }
+    gBacklogDirty = false;
+}
+
+void TickBacklogPersistence() {
+    if (gBacklogDirty && gTick - gLastBacklogSaveTick >= kBacklogSaveTicks) {
+        SaveBacklog();
+    }
+}
+
+// Keeps the alive / waiting numbers the UI reads up to date. The queue is only walked a few times a second.
+void UpdateStatsSnapshot() {
+    gStatAlive = static_cast<int>(gTrackedEnemies.size());
+    if (gTick % 5 != 0) {
+        return;
+    }
+    int waiting = 0;
+    int eliteWaiting = 0;
+    for (const PendingSpawn& pending : gPendingSpawns) {
+        if (IsTrackedSpawnName(pending.name)) {
+            waiting++;
+            const SpawnDef* def = FindSpawnDef(pending.name);
+            if (def != nullptr && def->weight >= kEliteWeight) {
+                eliteWaiting++;
+            }
+        }
+    }
+    gStatWaiting = waiting;
+    gStatEliteWaiting = eliteWaiting;
+
+    const s32 reserve = GetEliteReserve();
+    gStatEliteBankMax = reserve;
+    gStatEliteBank = std::min(CurrentLoads().elite, reserve);
+}
+
+// Tells the companion how many spawns wait and how loaded the game is (only when it changes, at most every ~0.5 s).
+void TickQueueReport() {
+    if (!gQueueReportForce && gTick - gLastQueueReportTick < kQueueReportTicks) {
+        return;
+    }
+    gLastQueueReportTick = gTick;
+    const json report = { { "event", "spawn_queue" },
+                          { "pending", gPendingSpawns.size() },
+                          { "active", gTrackedEnemies.size() },
+                          { "load", CurrentLoad() },
+                          { "max", GetMaxLoad() },
+                          { "eliteLoad", CurrentLoads().elite },
+                          { "eliteReserve", GetEliteReserve() },
+                          { "eliteWaiting", gStatEliteWaiting.load() } };
+    const std::string serialized = report.dump();
+    if (!gQueueReportForce && serialized == gLastQueueReport) {
+        return;
+    }
+    gQueueReportForce = false;
+    gLastQueueReport = serialized;
+    SendEventToBridge(report);
+}
+
+void TickPendingSpawns() {
+    if (gPlayState == nullptr || gPendingSpawns.empty() || gSpawnsSuspended.load()) {
+        return;
+    }
+    if (ShouldDeferDangerousEffects()) {
+        return;
+    }
+
+    // One spawn per turn, kSpawnGapFrames apart, so a refill after several deaths never arrives as a burst.
+    if (gTick < gNextSpawnTick) {
+        return;
+    }
+
+    // Two lanes. With ElitePriority the elite enemies (head-start bank, see HiveShockAdmission.h) are looked at first
+    // and the ordinary ones second; without it both go through one FIFO pass. Inside a lane it is first in, first
+    // out, and a full lane stops, so its first enemy keeps its turn. When an elite has no room, the ordinary lane
+    // pauses too: every point that frees up as ordinary enemies die is reserved for the elite, piling up kill after
+    // kill until it fits, instead of being refilled by the next wolf. A blocker that affects everybody (cutscene,
+    // room load) ends the scan. A spawn that is only blocked for itself (boss room, Lizalfos mini-boss) is stepped
+    // over and kept.
+    using HiveShockAdmission::Lane;
+    const bool elitePriority = CVarGetInteger(CVAR_REMOTE_HIVESHOCK("ElitePriority"), 1) != 0;
+    bool laneBlocked[2] = { false, false };
+    for (int pass = elitePriority ? 0 : 1; pass < 2; pass++) {
+        if (pass == 1 && elitePriority && laneBlocked[static_cast<int>(Lane::Elite)]) {
+            return; // the freed room belongs to the waiting elite
+        }
+
+        for (auto it = gPendingSpawns.begin(); it != gPendingSpawns.end();) {
+            if (gTick < it->earliestTick) {
+                ++it;
+                continue;
+            }
+
+            const SpawnDef* def = FindSpawnDef(it->name);
+            if (def == nullptr) {
+                SPDLOG_WARN("[HiveShock] pending spawn unknown '{}', discarding", it->name);
+                it = gPendingSpawns.erase(it);
+                gBacklogDirty = true;
+                continue;
+            }
+            const Lane lane = LaneOf(*def);
+            if (elitePriority && lane != (pass == 0 ? Lane::Elite : Lane::Ordinary)) {
+                ++it;
+                continue;
+            }
+            if (laneBlocked[static_cast<int>(lane)]) {
+                ++it;
+                continue;
+            }
+
+            const char* whyBlocked = nullptr;
+            switch (SpawnDefNow(*def, it->user, &whyBlocked)) {
+                case ApplyResult::Applied:
+                    if (IsTrackedSpawnName(def->name) && !it->requeued) {
+                        gStatSpawned++;
+                    }
+                    gPendingSpawns.erase(it);
+                    gBacklogDirty = true;
+                    gNextSpawnTick = gTick + kSpawnGapFrames;
+                    return;
+                case ApplyResult::Deferred:
+                    return;
+                case ApplyResult::LaneFull:
+                    laneBlocked[static_cast<int>(lane)] = true;
+                    if (lane == Lane::Elite && gTick - gLastEliteWaitLogTick >= kEliteWaitLogTicks) {
+                        gLastEliteWaitLogTick = gTick;
+                        SPDLOG_INFO("[HiveShock] elite '{}' is waiting, freed room is reserved for it: {}", it->name,
+                                    whyBlocked);
+                    }
+                    ++it;
+                    break;
+                case ApplyResult::Held:
+                    if (gTick - gLastHeldLogTick >= kHeldLogTicks) {
+                        gLastHeldLogTick = gTick;
+                        SPDLOG_INFO("[HiveShock] '{}' is held: {}", it->name,
+                                    whyBlocked != nullptr ? whyBlocked : "not possible here right now");
+                    }
+                    it->earliestTick = gTick + kHeldRecheckFrames;
+                    ++it;
+                    break;
+                case ApplyResult::Skipped:
+                    // Nothing could be placed this time (no floor, actor limit...). Keep it and try again shortly.
+                    if (++it->attempts % 8 == 1) {
+                        SPDLOG_WARN("[HiveShock] could not place '{}' (attempt {}), will retry", it->name,
+                                    it->attempts);
+                    }
+                    it->earliestTick = gTick + kFailedRetryFrames;
+                    ++it;
+                    break;
+                case ApplyResult::Rejected:
+                    it = gPendingSpawns.erase(it);
+                    gBacklogDirty = true;
+                    break;
+            }
+        }
+    }
+}
+
+ApplyResult SpawnNamed(const std::string& name, const std::string& user) {
+    const SpawnDef* def = FindSpawnDef(name);
+    if (def == nullptr) {
+        return ApplyResult::Skipped;
+    }
+    return EnqueueEnemySpawn(def->name, user, 0) ? ApplyResult::Applied : ApplyResult::Skipped;
+}
+
+ApplyResult SpawnRandomEnemy(const std::string& user) {
+    s32 count = ARRAY_COUNT(kRandomEnemies);
+    s32 index = (s32)(Rand_ZeroOne() * count);
+    if (index >= count) {
+        index = count - 1;
+    }
+    return SpawnNamed(kRandomEnemies[index], user);
+}
+
+ApplyResult SpawnCuccoArmy(const std::string& user) {
+    if (FindSpawnDef("cucco") == nullptr) {
+        return ApplyResult::Skipped;
+    }
+    constexpr s32 kCount = 6;
+    for (s32 i = 0; i < kCount; i++) {
+        if (!EnqueueEnemySpawn("cucco", user, (u32)(i * kCuccoArmyFrameGap))) {
+            return ApplyResult::Skipped;
+        }
+    }
+    return ApplyResult::Applied;
+}
+
+s32 WarpEntranceFromName(const std::string& name) {
+    std::string key = name;
+    if (key.rfind("warp_", 0) == 0) {
+        key = key.substr(5);
+    }
+    for (const WarpAlias& alias : kWarpAliases) {
+        if (key == alias.name) {
+            return alias.entrance;
+        }
+    }
+    return -1;
+}
+
+bool IsWarpAction(const std::string& action) {
+    return action == "warp" || action == "warp_random" || WarpEntranceFromName(action) >= 0;
+}
+
+ApplyResult ApplyOwlWarp(const json& cmd, const std::string& action) {
+    s32 requested = -1;
+    std::string target = GetStringField(cmd, "target");
+    if (target.empty()) {
+        target = GetStringField(cmd, "owl");
+    }
+    if (!target.empty()) {
+        requested = WarpEntranceFromName(target);
+    }
+    if (requested < 0 && action != "warp" && action != "warp_random") {
+        requested = WarpEntranceFromName(action);
+    }
+
+    s32 entrance = requested;
+    if (entrance < 0) {
+        s32 count = ARRAY_COUNT(kRandomWarps);
+        s32 pick = static_cast<s32>(Rand_ZeroOne() * count);
+        if (pick >= count) {
+            pick = count - 1;
+        }
+        entrance = kRandomWarps[pick];
+    }
+
+    GameInteractor::RawAction::TeleportPlayer(entrance);
+    SPDLOG_INFO("[HiveShock] warp entrance={}", entrance);
+    return ApplyResult::Applied;
+}
+
+void ApplyImpulse(Player* player, const json& cmd) {
+    float strength = std::clamp(GetNumber(cmd, 6.34375f), -20.0f, 20.0f);
+    player->actor.velocity.y = strength;
+}
+
+void ApplyHeal(const json& cmd) {
+    s16 amount = static_cast<s16>(std::clamp(GetNumber(cmd, 16.0f), 1.0f, 80.0f));
+    Health_ChangeBy(gPlayState, amount);
+}
+
+void ApplyDamage(const json& cmd) {
+    s16 amount = static_cast<s16>(std::clamp(GetNumber(cmd, 16.0f), 1.0f, 64.0f));
+    Health_ChangeBy(gPlayState, -amount);
+    GameInteractor::RawAction::KnockbackPlayer(std::clamp(GetNumber(cmd, 3.0f), 0.5f, 14.0f) / 5.0f);
+    ClampMinHealthAfterHit();
+}
+
+// The electrified hit reaction takes its damage from colChkInfo.damage (set by whatever actor hit Link); the raw
+// action leaves it at 0, so the shock would animate without hurting. Default matches a Bari/Biri touch: half a heart.
+void ApplyShock(const json& cmd) {
+    Player* player = GET_PLAYER(gPlayState);
+    s32 damage = static_cast<s32>(std::clamp(GetNumber(cmd, kDefaultShockDamage), 1.0f, 64.0f));
+    player->actor.colChkInfo.damage = static_cast<u8>(damage);
+    GameInteractor::RawAction::ElectrocutePlayer();
+    player->actor.colChkInfo.damage = 0;
+    ClampMinHealthAfterHit();
+}
+
+void ApplyKnockback(const json& cmd) {
+    float strength = std::clamp(GetNumber(cmd, 6.0f), 0.5f, 14.0f);
+    GameInteractor::RawAction::KnockbackPlayer(strength / 5.0f);
+    if (cmd.contains("damage") && cmd["damage"].is_number()) {
+        s16 damage = static_cast<s16>(std::clamp(cmd["damage"].get<float>(), 1.0f, 64.0f));
+        Health_ChangeBy(gPlayState, -damage);
+        ClampMinHealthAfterHit();
+    }
+}
+
+void ApplyInstaKill() {
+    gSaveContext.health = 0;
+}
+
+void ApplyRupees(const json& cmd) {
+    s16 amount = static_cast<s16>(std::clamp(GetNumber(cmd, 10.0f), -500.0f, 500.0f));
+    Rupees_ChangeBy(amount);
+}
+
+void ApplyMagic(const json& cmd) {
+    s16 amount = static_cast<s16>(std::clamp(GetNumber(cmd, static_cast<float>(MAGIC_NORMAL_METER)), -128.0f, 128.0f));
+    GameInteractor::RawAction::AddOrRemoveMagic(static_cast<int8_t>(amount));
+}
+
+void ApplyBomb() {
+    GameInteractor::RawAction::SpawnActor(ACTOR_EN_BOM, 0);
+}
+
+void ApplyBlast() {
+    GameInteractor::RawAction::SpawnActor(ACTOR_EN_BOM, 1);
+}
+
+// A full 999-rupee wallet can take ~55 items to drain at 20/5/1 per item -- all spawned
+// synchronously in a single frame, with no relation to EnsureActorHeadroom() or any other
+// actor cap. Bounding it here keeps a single gift from being able to flood the scene.
+constexpr s32 kMaxRupeeRainDrops = 20;
+
+void ApplyRupeeRain(Player* player) {
+    int16_t currentRupees = gSaveContext.rupees;
+    if (currentRupees <= 0) {
+        SPDLOG_INFO("[HiveShock] rupee_rain skipped, wallet empty");
+        return;
+    }
+
+    Vec3f positional = player->actor.world.pos;
+    positional.y += 100.0f;
+    s32 itemsSpawned = 0;
+    while (currentRupees > 0 && itemsSpawned < kMaxRupeeRainDrops) {
+        s16 drop;
+        s16 amount;
+        if (currentRupees >= 20) {
+            drop = ITEM00_RUPEE_RED;
+            amount = 20;
+        } else if (currentRupees >= 5) {
+            drop = ITEM00_RUPEE_BLUE;
+            amount = 5;
+        } else {
+            drop = ITEM00_RUPEE_GREEN;
+            amount = 1;
+        }
+        Rupees_ChangeBy(-amount);
+        currentRupees -= amount;
+        EnItem00* rupeeActor = Item_DropCollectible(gPlayState, &positional, drop);
+        if (rupeeActor != nullptr) {
+            rupeeActor->actor.speedXZ = Rand_CenteredFloat(5.0f);
+            rupeeActor->unk_15A = 600;
+        }
+        itemsSpawned++;
+    }
+}
+
+void ApplyHearts(Player* player) {
+    Vec3f positional = player->actor.world.pos;
+    positional.y += 60.0f;
+    for (s32 i = 0; i < 5; i++) {
+        EnItem00* heart = Item_DropCollectible(gPlayState, &positional, ITEM00_HEART);
+        if (heart != nullptr) {
+            heart->actor.speedXZ = Rand_CenteredFloat(6.0f);
+            heart->unk_15A = 600;
+        }
+    }
+}
+
+void ApplyInvert(const json& cmd) {
+    float duration = GetDuration(cmd);
+    if (duration <= 0.0f) {
+        duration = 20.0f;
+    }
+    duration = std::clamp(duration, 1.0f, 120.0f);
+    gInvertControls = true;
+    gInvertUntil =
+        Clock::now() + std::chrono::duration_cast<Clock::duration>(std::chrono::duration<float>(duration));
+    GameInteractor::State::ReverseControlsActive = true;
+    SPDLOG_INFO("[HiveShock] inverted controls for {:.1f}s", duration);
+}
+
+// Shares the Speed slot: slowing Link replaces a speed-up (and vice versa), and expiry restores normal speed.
+void ApplySlowDebuff(const json& cmd) {
+    f32 mult = std::clamp(GetNumber(cmd, kDefaultSlowMult), 0.2f, 0.9f);
+    ActivateBuff(BridgeBuff::Speed, BuffDurationFromCmd(cmd), mult);
+    GameInteractor::State::MovementSpeedMultiplier = mult;
+}
+
+void ApplySpeedBuff(const json& cmd) {
+    f32 mult = std::clamp(GetNumber(cmd, kDefaultSpeedMult), 1.25f, 4.0f);
+    ActivateBuff(BridgeBuff::Speed, BuffDurationFromCmd(cmd), mult);
+    GameInteractor::State::MovementSpeedMultiplier = mult;
+}
+
+void ApplyInvincibleBuff(const json& cmd) {
+    ActivateBuff(BridgeBuff::Invincible, BuffDurationFromCmd(cmd), 1.0f);
+    GameInteractor::RawAction::SetPlayerInvincibility(true);
+}
+
+void ApplyInfiniteMagicBuff(const json& cmd) {
+    ActivateBuff(BridgeBuff::InfiniteMagic, BuffDurationFromCmd(cmd), 1.0f);
+    TickInfiniteMagic();
+}
+
+void ApplyDamageUpBuff(const json& cmd) {
+    f32 mult = std::clamp(GetNumber(cmd, kDefaultDamageMult), 1.5f, 8.0f);
+    ActivateBuff(BridgeBuff::DamageUp, BuffDurationFromCmd(cmd), mult);
+}
+
+void ApplyHasteBuff(const json& cmd) {
+    float duration = BuffDurationFromCmd(cmd);
+    ActivateBuff(BridgeBuff::Speed, duration, kDefaultSpeedMult);
+    ActivateBuff(BridgeBuff::DamageUp, duration, kDefaultDamageMult);
+    GameInteractor::State::MovementSpeedMultiplier = kDefaultSpeedMult;
+}
+
+void ApplyTimeSkip() {
+    u16 previous = gSaveContext.dayTime;
+    u16 next = previous + 0x4000;
+    GameInteractor::RawAction::SetTimeOfDay(next);
+    SPDLOG_INFO("[HiveShock] time skipped (0x{:04X} -> 0x{:04X})", previous, gSaveContext.dayTime);
+}
+
+void ApplyDeleteSave() {
+    if (gSaveContext.fileNum >= 0 && gSaveContext.fileNum <= 2) {
+        SaveManager::Instance->DeleteZeldaFile(gSaveContext.fileNum);
+        SPDLOG_INFO("[HiveShock] deleted save slot {}", gSaveContext.fileNum + 1);
+    } else {
+        SPDLOG_WARN("[HiveShock] delete_save ignored (invalid fileNum {})", gSaveContext.fileNum);
+    }
+
+    gDeathCount = 0;
+    gDeathCountedThisCycle = false;
+    NotifyDeathsReset("save_deleted");
+
+    auto console = std::reinterpret_pointer_cast<Ship::ConsoleWindow>(
+        Ship::Context::GetInstance()->GetWindow()->GetGui()->GetGuiWindow("Console"));
+    if (console != nullptr) {
+        console->Dispatch("reset");
+    } else {
+        SPDLOG_WARN("[HiveShock] Console window missing; could not reset to file select");
+    }
+}
+
+void TickTimedEffects() {
+    if (gTimeIsFrozen && gTimeFreezeHasDeadline && Clock::now() >= gTimeFrozenUntil) {
+        ResumeTime();
+    }
+    if (gInvertControls && Clock::now() >= gInvertUntil) {
+        gInvertControls = false;
+        GameInteractor::State::ReverseControlsActive = false;
+        SPDLOG_INFO("[HiveShock] controls restored");
+    }
+    ClearExpiredBuffs();
+    TickInfiniteMagic();
+    TickInvincible();
+}
+
+ApplyResult ApplyCommand(const json& cmd) {
+    // Works anywhere, including the title screen, so it runs before the "in a scene" checks.
+    {
+        const std::string early = NormalizeActionName(GetStringField(cmd, "action"));
+        if (early == "clear_queue" || early == "clear_pending") {
+            ClearPendingSpawns();
+            return ApplyResult::Applied;
+        }
+    }
+
+    std::string action = NormalizeActionName(GetStringField(cmd, "action"));
+    if (action.empty()) {
+        SPDLOG_WARN("[HiveShock] command missing 'action'");
+        return ApplyResult::Skipped;
+    }
+
+    if (action == "spawn" || action == "spawn_enemy" || action == "spawn_actor") {
+        std::string enemy = GetStringField(cmd, "enemy");
+        if (enemy.empty()) {
+            enemy = GetStringField(cmd, "name");
+        }
+        if (enemy.empty()) {
+            enemy = GetStringField(cmd, "actor");
+        }
+        if (enemy.empty()) {
+            enemy = GetStringField(cmd, "type");
+        }
+        if (!enemy.empty()) {
+            action = NormalizeActionName(enemy);
+        }
+    }
+
+    // Spawns go straight to the backlog, whatever Link is doing (cutscene, scene change, dead, title screen). When
+    // and whether they enter the game is decided by TickPendingSpawns, so a spawn that has to wait can never hold
+    // up the commands queued behind it.
+    if (action == "random_enemy" || action == "cucco_army" || FindSpawnDef(action) != nullptr) {
+        LogUser(cmd, action);
+        const std::string spawnUser = TruncateDonorName(GetStringField(cmd, "user"));
+        if (action == "random_enemy") {
+            return SpawnRandomEnemy(spawnUser);
+        }
+        if (action == "cucco_army") {
+            return SpawnCuccoArmy(spawnUser);
+        }
+        return SpawnNamed(action, spawnUser);
+    }
+
+    if (gPlayState == nullptr) {
+        return ApplyResult::Deferred;
+    }
+
+    Player* player = GET_PLAYER(gPlayState);
+    if (player == nullptr) {
+        return ApplyResult::Deferred;
+    }
+
+    if (ShouldDeferEffects()) {
+        return ApplyResult::Deferred;
+    }
+
+    LogUser(cmd, action);
+
+    if (action == "impulse") {
+        ApplyImpulse(player, cmd);
+    } else if (action == "knockback") {
+        ApplyKnockback(cmd);
+    } else if (action == "freeze") {
+        GameInteractor::RawAction::FreezePlayer();
+    } else if (action == "shock") {
+        ApplyShock(cmd);
+    } else if (action == "fire") {
+        GameInteractor::RawAction::BurnPlayer();
+    } else if (action == "heal") {
+        ApplyHeal(cmd);
+    } else if (action == "damage") {
+        ApplyDamage(cmd);
+    } else if (action == "insta_kill" || action == "instakill" || action == "kill") {
+        ApplyInstaKill();
+    } else if (action == "rupees") {
+        ApplyRupees(cmd);
+    } else if (action == "magic") {
+        ApplyMagic(cmd);
+    } else if (action == "bomb") {
+        ApplyBomb();
+    } else if (action == "freeze_time") {
+        FreezeTime(GetDuration(cmd));
+    } else if (action == "resume_time") {
+        ResumeTime();
+    } else if (action == "blast") {
+        ApplyBlast();
+    } else if (action == "rupee_rain") {
+        ApplyRupeeRain(player);
+    } else if (action == "hearts") {
+        ApplyHearts(player);
+    } else if (action == "invert") {
+        ApplyInvert(cmd);
+    } else if (action == "slow" || action == "slow_down" || action == "slowdown") {
+        ApplySlowDebuff(cmd);
+    } else if (action == "speed") {
+        ApplySpeedBuff(cmd);
+    } else if (action == "invincible" || action == "invencible") {
+        ApplyInvincibleBuff(cmd);
+    } else if (action == "infinite_magic") {
+        ApplyInfiniteMagicBuff(cmd);
+    } else if (action == "damage_up") {
+        ApplyDamageUpBuff(cmd);
+    } else if (action == "haste") {
+        ApplyHasteBuff(cmd);
+    } else if (IsWarpAction(action)) {
+        return ApplyOwlWarp(cmd, action);
+    } else if (action == "time_skip") {
+        ApplyTimeSkip();
+    } else if (action == "delete_save" || action == "new_run") {
+        ApplyDeleteSave();
+    } else if (action == "clear_enemies") {
+        ClearBridgeEnemies();
+    } else {
+        SPDLOG_WARN("[HiveShock] unknown action '{}'", action);
+        return ApplyResult::Skipped;
+    }
+
+    return ApplyResult::Applied;
+}
+
+void HandleClient(SocketHandle clientSocket, SocketHandle listenSocket) {
+    SPDLOG_INFO("[HiveShock] client connected");
+    gClientConnected = true;
+    ConfigureSocket(clientSocket);
+    std::string buffer;
+    char recvBuf[1024];
+
+    auto handleLine = [](std::string line) {
+        if (!line.empty() && line.back() == '\r') {
+            line.pop_back();
+        }
+        if (line.empty()) {
+            return;
+        }
+        if (line.size() > kMaxLineBytes) {
+            SPDLOG_WARN("[HiveShock] dropping oversized JSON line ({} bytes)", line.size());
+            return;
+        }
+        try {
+            json parsed = json::parse(line);
+            SPDLOG_INFO("[HiveShock] received '{}'", GetStringField(parsed, "action"));
+            PushCommand(std::move(parsed));
+        } catch (const std::exception& e) { SPDLOG_WARN("[HiveShock] invalid JSON: {}", e.what()); }
+    };
+
+    while (gServerRun.load()) {
+        // Wake up periodically so Disable() never has to interrupt a blocking recv().
+        const int ready = WaitForEitherReadable(clientSocket, listenSocket, kPollIntervalMs);
+        if (ready & 2) {
+            // A new client is waiting: drop this one (it may be stale) so the new connection isn't starved.
+            SPDLOG_INFO("[HiveShock] new connection pending, replacing current client");
+            break;
+        }
+        if (!(ready & 1)) {
+            continue;
+        }
+
+        auto bytesReceived = recv(clientSocket, recvBuf, sizeof(recvBuf), 0);
+        if (bytesReceived == 0) {
+            break;
+        }
+        if (bytesReceived < 0) {
+            if (LastSocketErrorIsTransient()) {
+                continue;
+            }
+            break;
+        }
+
+        buffer.append(recvBuf, static_cast<size_t>(bytesReceived));
+
+        size_t newlinePos;
+        while ((newlinePos = buffer.find('\n')) != std::string::npos) {
+            std::string line = buffer.substr(0, newlinePos);
+            buffer.erase(0, newlinePos + 1);
+            handleLine(std::move(line));
+        }
+
+        // A peer that never sends a newline must not grow the buffer without bound.
+        if (buffer.size() > kMaxLineBytes) {
+            SPDLOG_WARN("[HiveShock] dropping oversized line without newline ({} bytes)", buffer.size());
+            buffer.clear();
+        }
+    }
+
+    // Some clients send one JSON object and close without a trailing newline: don't lose it.
+    if (!buffer.empty()) {
+        handleLine(std::move(buffer));
+    }
+
+    CloseSocket(clientSocket);
+    gClientConnected = false;
+    SPDLOG_INFO("[HiveShock] client disconnected");
+}
+
+void RunServer(uint16_t port) {
+    NetSession session;
+    if (!session.ok) {
+        SPDLOG_ERROR("[HiveShock] network subsystem init failed ({})", LastSocketError());
+        gServerRun = false;
+        return;
+    }
+
+    SocketHandle listenSocket = socket(AF_INET, SOCK_STREAM, 0);
+    if (listenSocket == kInvalidSocket) {
+        SPDLOG_ERROR("[HiveShock] socket() failed ({})", LastSocketError());
+        gServerRun = false;
+        return;
+    }
+    ConfigureSocket(listenSocket);
+
+#ifdef _WIN32
+    // Exclusive bind: SO_REUSEADDR on Windows would let another process hijack the port.
+    BOOL exclusive = TRUE;
+    setsockopt(listenSocket, SOL_SOCKET, SO_EXCLUSIVEADDRUSE, reinterpret_cast<const char*>(&exclusive),
+               sizeof(exclusive));
+#else
+    // Allows immediate re-bind after Disable()/Enable() (TIME_WAIT); safe on POSIX.
+    int reuse = 1;
+    if (setsockopt(listenSocket, SOL_SOCKET, SO_REUSEADDR, &reuse, sizeof(reuse)) != 0) {
+        SPDLOG_WARN("[HiveShock] SO_REUSEADDR failed ({})", LastSocketError());
+    }
+#endif
+
+    // Unlike the desktop build, the companion app usually runs on another device on the same network (a phone has no
+    // "localhost" companion), so listen on all interfaces.
+    sockaddr_in serverAddr{};
+    serverAddr.sin_family = AF_INET;
+    serverAddr.sin_addr.s_addr = htonl(INADDR_ANY);
+    serverAddr.sin_port = htons(port);
+    if (bind(listenSocket, reinterpret_cast<sockaddr*>(&serverAddr), sizeof(serverAddr)) != 0) {
+        SPDLOG_ERROR("[HiveShock] bind 0.0.0.0:{} failed ({})", port, LastSocketError());
+        CloseSocket(listenSocket);
+        gServerRun = false;
+        return;
+    }
+
+    if (listen(listenSocket, 1) != 0) {
+        SPDLOG_ERROR("[HiveShock] listen() failed ({})", LastSocketError());
+        CloseSocket(listenSocket);
+        gServerRun = false;
+        return;
+    }
+
+    gListening = true;
+    SPDLOG_INFO("[HiveShock] listening on 0.0.0.0:{} (device IP: {})", port, GetLocalIPImpl());
+
+    while (gServerRun.load()) {
+        if (!WaitForSocket(listenSocket, true, kPollIntervalMs)) {
+            continue;
+        }
+        SocketHandle clientSocket = accept(listenSocket, nullptr, nullptr);
+        if (clientSocket == kInvalidSocket) {
+            if (LastSocketErrorIsTransient()) {
+                continue;
+            }
+            SPDLOG_ERROR("[HiveShock] accept() failed ({})", LastSocketError());
+            break;
+        }
+        HandleClient(clientSocket, listenSocket);
+    }
+
+    gListening = false;
+    gClientConnected = false;
+    CloseSocket(listenSocket);
+    // If the loop ended on an error rather than Disable(), reflect that in IsEnabled().
+    gServerRun = false;
+    SPDLOG_INFO("[HiveShock] server stopped");
+}
+
+void StartServer() {
+    if (gServerRun.exchange(true)) {
+        return;
+    }
+    if (!gBacklogLoaded) {
+        LoadBacklog();
+    }
+
+    if (gServerThreadHolder.thread.joinable()) {
+        gServerThreadHolder.thread.join();
+    }
+    const auto port =
+        static_cast<uint16_t>(std::clamp(CVarGetInteger(CVAR_REMOTE_HIVESHOCK("Port"), kDefaultPort), 1025, 65534));
+    gPort = port;
+    gServerThreadHolder.thread = std::thread(RunServer, port);
+}
+
+void StopServer() {
+    gServerRun = false;
+    // Every blocking call in the server thread polls with a timeout, so this returns promptly.
+    if (gServerThreadHolder.thread.joinable()) {
+        gServerThreadHolder.thread.join();
+    }
+
+    ClearCommandQueue();
+    // Disabling is deliberate: forget everything that was waiting (and its copy on disk). If the server never ran in
+    // this process the saved backlog is left alone.
+    gTrackedEnemies.clear();
+    gPests.clear();
+    gNavis.clear();
+    if (gBacklogLoaded) {
+        gPendingSpawns.clear();
+        SaveBacklog();
+    }
+    gStatTotal = gStatSpawned = gStatDefeated = gStatAlive = gStatWaiting = 0;
+    gStatEliteBank = gStatEliteBankMax = gStatEliteWaiting = 0;
+    gListening = false;
+    gClientConnected = false;
+}
+
+} // namespace
+
+extern "C" float HiveShock_GetOutgoingDamageMultiplier(void) {
+    return CurrentOutgoingDamageMultiplier();
+}
+
+extern "C" int HiveShock_IsPestActor(const Actor* actor) {
+    if (actor == nullptr) {
+        return 0;
+    }
+    for (const PestState& pest : gPests) {
+        if (pest.actor == actor) {
+            return 1;
+        }
+    }
+    return 0;
+}
+
+void HiveShock::Enable() {
+    StartServer();
+    // Registers the per-frame hook that drains the command queue; without it, enabling from the menu after boot
+    // accepts connections but never applies anything.
+    ShipInit::Init(CVAR_NAME);
+}
+
+void HiveShock::Disable() {
+    StopServer();
+    ShipInit::Init(CVAR_NAME);
+}
+
+bool HiveShock::IsEnabled() {
+    return gServerRun.load();
+}
+
+bool HiveShock::IsListening() {
+    return gListening.load();
+}
+
+bool HiveShock::IsClientConnected() {
+    return gClientConnected.load();
+}
+
+uint16_t HiveShock::GetPort() {
+    return gServerRun.load() ? gPort.load()
+                             : static_cast<uint16_t>(std::clamp(
+                                   CVarGetInteger(CVAR_REMOTE_HIVESHOCK("Port"), kDefaultPort), 1025, 65534));
+}
+
+std::string HiveShock::GetLocalIP() {
+    return GetLocalIPImpl();
+}
+
+HiveShock::Stats HiveShock::GetStats() {
+    Stats stats;
+    stats.total = gStatTotal.load();
+    stats.spawned = gStatSpawned.load();
+    stats.defeated = gStatDefeated.load();
+    stats.alive = gStatAlive.load();
+    stats.waiting = gStatWaiting.load();
+    stats.eliteBank = gStatEliteBank.load();
+    stats.eliteBankMax = gStatEliteBankMax.load();
+    stats.eliteWaiting = gStatEliteWaiting.load();
+    return stats;
+}
+
+void HiveShock::ResetStats() {
+    const int alive = gStatAlive.load();
+    gStatDefeated = 0;
+    gStatSpawned = alive;
+    gStatTotal = alive + gStatWaiting.load();
+}
+
+void HiveShock::OnMemoryPressure(int level) {
+    // `level` is an Android ComponentCallbacks2 TRIM_MEMORY_* value; <= 0 is our own "pressure cleared" signal (sent
+    // from onResume()), since the real constants all start at 5. Safe to call from any thread: it only touches atomics
+    // and the game thread does the clean-up.
+    if (level <= 0) {
+        gBudgetPercent = 100;
+        gSpawnsSuspended = false;
+        SPDLOG_INFO("[HiveShock] memory pressure cleared, caps restored");
+        return;
+    }
+    // RUNNING_CRITICAL (15), BACKGROUND (40), MODERATE (60) and COMPLETE (80): the process is at real risk of being
+    // reclaimed. Stop growing the problem and have the game thread drop the live injected enemies.
+    if (level == 15 || level >= 40) {
+        gSpawnsSuspended = true;
+        gClearRequested = true;
+        SPDLOG_WARN("[HiveShock] critical memory pressure (level={}), spawns suspended and enemies cleared", level);
+        return;
+    }
+    // RUNNING_MODERATE (5), RUNNING_LOW (10), UI_HIDDEN (20): keep playing with half the budget.
+    gSpawnsSuspended = false;
+    gBudgetPercent = 50;
+    SPDLOG_WARN("[HiveShock] moderate memory pressure (level={}), caps halved", level);
+}
+
+#ifdef __ANDROID__
+// Called from MainActivity.onTrimMemory()/onLowMemory()/onResume(). Keeping the JNI glue
+// here (rather than in libultraship's Android glue) keeps the memory-pressure policy next to
+// the state it governs.
+extern "C" JNIEXPORT void JNICALL Java_com_dishii_soh_MainActivity_nativeTrimMemory(JNIEnv*, jobject, jint level) {
+    HiveShock::OnMemoryPressure(static_cast<int>(level));
+}
+#endif
+
+static void RegisterHiveShock() {
+    const bool enabled = CVAR_ENABLED;
+
+    if (enabled) {
+        StartServer();
+    } else {
+        StopServer();
+    }
+
+    COND_HOOK(OnGameFrameUpdate, enabled, []() {
+        gTick++;
+
+        json cmd;
+        while (PopCommand(cmd)) {
+            ApplyResult result = ApplyCommand(cmd);
+            if (result == ApplyResult::Deferred) {
+                // Throttled: this runs every frame while the command waits.
+                static u32 sLastDeferLogTick = 0;
+                if (gTick - sLastDeferLogTick >= 40) {
+                    sLastDeferLogTick = gTick;
+                    SPDLOG_INFO("[HiveShock] '{}' is waiting: {}", GetStringField(cmd, "action"), DeferReason());
+                }
+                PushCommandFront(std::move(cmd));
+                break;
+            }
+        }
+
+        TickTimedEffects();
+
+        if (gPlayState != nullptr && gClearRequested.exchange(false)) {
+            DefeatAliveEnemies("critical memory pressure");
+        }
+
+        if (gPlayState == nullptr) {
+            // Title screen / file select: the live enemies are gone, but they and the spawns viewers paid for stay
+            // queued.
+            gLastRoom = -1;
+            ResetBridgeActorTracking();
+            gNavis.clear(); // back at the title screen: the Navis do not carry over to another save
+            UpdateStatsSnapshot();
+            TickQueueReport();
+            TickBacklogPersistence();
+            return;
+        }
+
+        const s16 room = gPlayState->roomCtx.curRoom.num;
+        if (room != gLastRoom) {
+            if (gLastRoom != -1) {
+                gRoomGraceUntilTick = gTick + kRoomGraceTicks;
+                // Before the upkeep below, so the grace window cannot queue them again.
+                if (CVarGetInteger(CVAR_REMOTE_HIVESHOCK("DespawnOnZoneChange"), 0)) {
+                    DefeatAliveEnemies("zone change");
+                }
+            }
+            gLastRoom = room;
+        }
+
+        UpdateTrackedEnemies();
+        UpdatePests();
+        UpdateNavis();
+        TickPendingSpawns();
+        UpdateStatsSnapshot();
+        TickQueueReport();
+        TickBacklogPersistence();
+
+        if (gPlayState->gameOverCtx.state == GAMEOVER_DEATH_WAIT_GROUND && !gDeathCountedThisCycle) {
+            RegisterDeath("player death");
+            ClearNavis();
+            if (CVarGetInteger(CVAR_REMOTE_HIVESHOCK("DefeatOnDeath"), 0)) {
+                DefeatAliveEnemies("Link died");
+            }
+        } else if (gPlayState->gameOverCtx.state == GAMEOVER_INACTIVE) {
+            gDeathCountedThisCycle = false;
+        }
+    });
+
+    // A Gerudo Fighter with no key flag only exists when HiveShock (or the enemy randomizer) spawns it. The vanilla
+    // ones wait for a switch flag and, when they beat Link, send him to the jail; neither makes sense here.
+    COND_VB_SHOULD(VB_GERUDO_FIGHTER_CONTINUE_WAITING, enabled, {
+        EnGeldB* enGeldB = va_arg(args, EnGeldB*);
+
+        if (enGeldB->keyFlag == 0 && (!enGeldB->invisible || enGeldB->actor.xzDistToPlayer <= 300.0f)) {
+            *should = false;
+        }
+    });
+
+    // Mido only exists in the Kokiri Forest, his house and the Lost Woods; the one HiveShock sends can be anywhere.
+    COND_VB_SHOULD(VB_MIDO_SPAWN, enabled, {
+        if (gPestSpawning) {
+            *should = true;
+        }
+    });
+
+    COND_VB_SHOULD(VB_GERUDO_FIGHTER_PLAY_MINIBOSS_MUSIC, enabled, {
+        EnGeldB* enGeldB = va_arg(args, EnGeldB*);
+
+        if (enGeldB->keyFlag == 0) {
+            *should = false;
+        }
+    });
+
+    // Same as a Wallmaster: send Link back to the last entrance instead of the jail.
+    COND_VB_SHOULD(VB_GERUDO_FIGHTER_THROW_LINK_TO_JAIL, enabled, {
+        EnGeldB* enGeldB = va_arg(args, EnGeldB*);
+
+        if (enGeldB->keyFlag == 0) {
+            *should = false;
+            Sfx_PlaySfxCentered(NA_SE_OC_ABYSS);
+            Play_TriggerRespawn(gPlayState);
+        }
+    });
+
+    COND_ID_HOOK(OnEnemyDefeat, ACTOR_EN_GELDB, enabled, [](void* refActor) {
+        EnGeldB* enGeldB = static_cast<EnGeldB*>(refActor);
+
+        if (enGeldB->keyFlag == 0) {
+            Item_DropCollectibleRandom(gPlayState, &enGeldB->actor, &enGeldB->actor.world.pos, 0xC0);
+        }
+    });
+
+    COND_HOOK(OnSceneInit, enabled, [](int16_t /*sceneNum*/) {
+        gLastRoom = -1;
+        ResetBridgeActorTracking();
+    });
+}
+
+static RegisterShipInitFunc initFunc(RegisterHiveShock, { CVAR_NAME });
+
+#else // __SWITCH__ || __WIIU__
+
+extern "C" float HiveShock_GetOutgoingDamageMultiplier(void) {
+    return 1.0f;
+}
+
+extern "C" int HiveShock_IsPestActor(const Actor* /*actor*/) {
+    return 0;
+}
+
+void HiveShock::Enable() {
+    SPDLOG_WARN("[HiveShock] not supported on this platform");
+}
+
+void HiveShock::Disable() {
+}
+
+bool HiveShock::IsEnabled() {
+    return false;
+}
+
+bool HiveShock::IsListening() {
+    return false;
+}
+
+bool HiveShock::IsClientConnected() {
+    return false;
+}
+
+uint16_t HiveShock::GetPort() {
+    return 0;
+}
+
+HiveShock::Stats HiveShock::GetStats() {
+    return Stats{};
+}
+
+void HiveShock::ResetStats() {
+}
+
+void HiveShock::OnMemoryPressure(int level) {
+}
+
+static void RegisterHiveShock() {
+}
+
+static RegisterShipInitFunc initFunc(RegisterHiveShock, { CVAR_REMOTE_HIVESHOCK("Enabled") });
+
+#endif

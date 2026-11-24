@@ -161,6 +161,12 @@ typedef struct BossGanon {
     /* 0x0718 */ s16 organAlpha;
     /* 0x071A */ u8 useOpenHand;
     /* 0x071B */ u8 windowShatterState;
-} BossGanon; // size = 0x71C
+    // HiveShock: spawned as an enemy outside the tower. The fight is played around hiveHome (a spot that follows
+    // Link) and, once beaten, ends in an explosion instead of the story cutscene.
+    u8 hiveShock;
+    Vec3f hiveHome;
+    // Which state slot this Ganondorf, or the ball he threw, uses (0 = the story fight, -1 = never initialised).
+    s8 hiveSlot;
+} BossGanon;
 
 #endif

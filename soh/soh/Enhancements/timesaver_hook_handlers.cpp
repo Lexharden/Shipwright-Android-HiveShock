@@ -35,6 +35,7 @@ extern "C" {
 #include <overlays/actors/ovl_Boss_Ganondrof/z_boss_ganondrof.h>
 #include <overlays/actors/ovl_En_Ik/z_en_ik.h>
 #include <objects/object_gnd/object_gnd.h>
+#include "soh/Network/HiveShock/HiveShock.h"
 extern SaveContext gSaveContext;
 extern PlayState* gPlayState;
 extern int32_t D_8011D3AC;
@@ -540,8 +541,12 @@ void TimeSaverOnVanillaBehaviorHandler(GIVanillaBehavior id, bool* should, va_li
             break;
         }
         case VB_OWL_INTERACTION: {
+            EnOwl* hiveOwl = va_arg(args, EnOwl*);
+            if (HiveShock_IsPestActor(&hiveOwl->actor)) {
+                break; // the owl HiveShock sends talks no matter what
+            }
             if (CVarGetInteger(CVAR_ENHANCEMENT("TimeSavers.SkipOwlInteractions"), IS_RANDO) && *should) {
-                EnOwl* enOwl = va_arg(args, EnOwl*);
+                EnOwl* enOwl = hiveOwl;
                 s32 owlType = (enOwl->actor.params & 0xFC0) >> 6;
 
                 if (((enOwl->actor.params & 0xFC0) >> 6) == 1) {

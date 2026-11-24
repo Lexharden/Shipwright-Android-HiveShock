@@ -128,10 +128,11 @@ void EnTorch2_Init(Actor* thisx, PlayState* play2) {
     PlayState* play = play2;
     Player* this = (Player*)thisx;
 
-    // Change Dark Link to regular enemy instead of boss with enemy randomizer and crowd control.
-    // This way Dark Link will be considered for "clear enemy" rooms properly.
+    // Change Dark Link to regular enemy instead of boss with enemy randomizer, crowd control,
+    // or HiveShock. This way Dark Link will be considered for "clear enemy" rooms properly.
     if (CVarGetInteger(CVAR_ENHANCEMENT("RandomizedEnemies"), 0) ||
-        (CVarGetInteger(CVAR_REMOTE_CROWD_CONTROL("Enabled"), 0))) {
+        (CVarGetInteger(CVAR_REMOTE_CROWD_CONTROL("Enabled"), 0)) ||
+        (CVarGetInteger(CVAR_REMOTE_HIVESHOCK("Enabled"), 0))) {
         Actor_ChangeCategory(play, &play->actorCtx, thisx, ACTORCAT_ENEMY);
     }
 
@@ -166,6 +167,13 @@ void EnTorch2_Init(Actor* thisx, PlayState* play2) {
     sLastSwordAnim = 0;
     sAlpha = 95;
     sSpawnPoint = this->actor.home.pos;
+
+    // HiveShock: skip the intro (waiting for Link to come close, then a ~20s fade-in during which Dark Link
+    // never swings) so he is fully opaque and attacking from the moment he spawns.
+    if (CVarGetInteger(CVAR_REMOTE_HIVESHOCK("Enabled"), 0)) {
+        sActionState = ENTORCH2_ATTACK;
+        sAlpha = 255;
+    }
 }
 
 void EnTorch2_Destroy(Actor* thisx, PlayState* play) {

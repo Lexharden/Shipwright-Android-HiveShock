@@ -192,8 +192,11 @@ void EnSkb_Destroy(Actor* thisx, PlayState* play) {
 }
 
 void func_80AFCD60(EnSkb* this) {
-    // Don't despawn stallchildren during daytime when enemy randomizer is enabled.
-    if (IS_DAY && !CVarGetInteger(CVAR_ENHANCEMENT("RandomizedEnemies"), 0)) {
+    // Don't despawn stallchildren during daytime when enemy randomizer or HiveShock is
+    // active -- HiveShock donors can gift a Stalchild at any time of day and it should
+    // stick around like any other gifted enemy instead of instantly vanishing.
+    if (IS_DAY && !CVarGetInteger(CVAR_ENHANCEMENT("RandomizedEnemies"), 0) &&
+        !CVarGetInteger(CVAR_REMOTE_HIVESHOCK("Enabled"), 0)) {
         func_80AFCF48(this);
     } else if (Actor_IsFacingPlayer(&this->actor, 0x11C7) &&
                (this->actor.xzDistToPlayer < (60.0f + (this->actor.params * 6.0f)))) {
@@ -291,9 +294,10 @@ void EnSkb_Advance(EnSkb* this, PlayState* play) {
         }
     }
     // Don't despawn stallchildren during daytime or when a stalchildren walks too far away from his "home" when enemy
-    // randomizer is enabled.
+    // randomizer or HiveShock is active.
     if ((Math_Vec3f_DistXZ(&this->actor.home.pos, &player->actor.world.pos) > 800.0f || IS_DAY) &&
-        !CVarGetInteger(CVAR_ENHANCEMENT("RandomizedEnemies"), 0)) {
+        !CVarGetInteger(CVAR_ENHANCEMENT("RandomizedEnemies"), 0) &&
+        !CVarGetInteger(CVAR_REMOTE_HIVESHOCK("Enabled"), 0)) {
         func_80AFCF48(this);
     } else if (Actor_IsFacingPlayer(&this->actor, 0x11C7) &&
                (this->actor.xzDistToPlayer < (60.0f + (this->actor.params * 6.0f)))) {

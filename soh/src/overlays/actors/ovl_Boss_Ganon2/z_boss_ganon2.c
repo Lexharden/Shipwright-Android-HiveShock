@@ -7,6 +7,7 @@
 #include "objects/object_ganon_anime3/object_ganon_anime3.h"
 #include "objects/object_geff/object_geff.h"
 #include "soh/frame_interpolation.h"
+#include "soh/Network/HiveShock/HiveShockBossDeath.h"
 #include "soh/OTRGlobals.h"
 #include "soh/ResourceManagerHelpers.h"
 #include "soh/Enhancements/game-interactor/GameInteractor_Hooks.h"
@@ -22,6 +23,12 @@ void BossGanon2_Destroy(Actor* thisx, PlayState* play);
 void BossGanon2_Update(Actor* thisx, PlayState* play);
 void BossGanon2_Draw(Actor* thisx, PlayState* play);
 void BossGanon2_Reset(void);
+
+// The real bodies of the callbacks above; the callbacks themselves only select the HiveShock slot (see below).
+void BossGanon2_Init_Slotted(Actor* thisx, PlayState* play);
+void BossGanon2_Destroy_Slotted(Actor* thisx, PlayState* play);
+void BossGanon2_Update_Slotted(Actor* thisx, PlayState* play);
+void BossGanon2_Draw_Slotted(Actor* thisx, PlayState* play);
 
 void func_808FD5C4(BossGanon2* this, PlayState* play);
 void func_808FD5F4(BossGanon2* this, PlayState* play);
@@ -74,6 +81,157 @@ Vec3f D_80910608[4];
 
 s8 D_80910638;
 
+// HiveShock can have several beasts at once. The variables above (and D_80906D78 / D_80907080 from the data file) belong
+// to ONE fight, so every HiveShock beast owns a slot with its own copy. Slot 0 is the story fight and keeps using the
+// variables directly. Each callback of a beast loads its slot into the variables on entry and stores it back on exit,
+// so the rest of the file keeps reading and writing the variables as it always did. The effect pool is not copied:
+// play->specialEffects is pointed at the slot's own pool while the callback runs and put back afterwards.
+typedef struct {
+    Vec3f vec8090EB20;
+    s8 val80910638;
+    EnZl3* zelda;
+    Actor* actor8090EB30;
+    s32 seed1;
+    s32 seed2;
+    s32 seed3;
+    Vec3f vecs809105D8[4];
+    Vec3f vecs80910608[4];
+    u8 flag80906D78;
+    s16 alpha80907080;
+    u8 inUse;
+} BossGanon2Slot;
+
+typedef struct {
+    s32 slot;
+    void* effects;
+} BossGanon2Scope;
+
+static BossGanon2Slot sSlots[HIVESHOCK_MAX_GANON_BEAST + 1];
+static BossGanon2Effect sHiveEffects[HIVESHOCK_MAX_GANON_BEAST][100];
+static s32 sCurSlot = 0; // the variables above currently hold the values of this slot
+
+static void BossGanon2_StoreSlot(void) {
+    BossGanon2Slot* slot = &sSlots[sCurSlot];
+
+    slot->vec8090EB20 = D_8090EB20;
+    slot->val80910638 = D_80910638;
+    slot->zelda = sBossGanon2Zelda;
+    slot->actor8090EB30 = D_8090EB30;
+    slot->seed1 = sBossGanon2Seed1;
+    slot->seed2 = sBossGanon2Seed2;
+    slot->seed3 = sBossGanon2Seed3;
+    memcpy(slot->vecs809105D8, D_809105D8, sizeof(D_809105D8));
+    memcpy(slot->vecs80910608, D_80910608, sizeof(D_80910608));
+    slot->flag80906D78 = D_80906D78;
+    slot->alpha80907080 = D_80907080;
+}
+
+static void BossGanon2_LoadSlot(s32 index) {
+    BossGanon2Slot* slot = &sSlots[index];
+
+    sCurSlot = index;
+    D_8090EB20 = slot->vec8090EB20;
+    D_80910638 = slot->val80910638;
+    sBossGanon2Zelda = slot->zelda;
+    D_8090EB30 = slot->actor8090EB30;
+    sBossGanon2Seed1 = slot->seed1;
+    sBossGanon2Seed2 = slot->seed2;
+    sBossGanon2Seed3 = slot->seed3;
+    memcpy(D_809105D8, slot->vecs809105D8, sizeof(D_809105D8));
+    memcpy(D_80910608, slot->vecs80910608, sizeof(D_80910608));
+    D_80906D78 = slot->flag80906D78;
+    D_80907080 = slot->alpha80907080;
+}
+
+static BossGanon2Scope BossGanon2_EnterSlot(PlayState* play, s32 index) {
+    BossGanon2Scope previous = { sCurSlot, play->specialEffects };
+
+    if (index < 0 || index > HIVESHOCK_MAX_GANON_BEAST) {
+        index = 0;
+    }
+    if (index != sCurSlot) {
+        BossGanon2_StoreSlot();
+        BossGanon2_LoadSlot(index);
+        play->specialEffects = (index == 0) ? (void*)sBossGanon2Particles : (void*)sHiveEffects[index - 1];
+    }
+    return previous;
+}
+
+static void BossGanon2_LeaveSlot(PlayState* play, BossGanon2Scope previous) {
+    if (sCurSlot != previous.slot) {
+        BossGanon2_StoreSlot();
+        BossGanon2_LoadSlot(previous.slot);
+        play->specialEffects = previous.effects;
+    }
+}
+
+// Returns the index of a free HiveShock slot (cleared, with an empty effect pool), or -1 when all are taken.
+static s32 BossGanon2_AllocHiveSlot(void) {
+    s32 i;
+
+    for (i = 1; i <= HIVESHOCK_MAX_GANON_BEAST; i++) {
+        if (!sSlots[i].inUse) {
+            memset(&sSlots[i], 0, sizeof(sSlots[i]));
+            memset(sHiveEffects[i - 1], 0, sizeof(sHiveEffects[i - 1]));
+            sSlots[i].inUse = 1;
+            return i;
+        }
+    }
+    return -1;
+}
+
+void BossGanon2_Update(Actor* thisx, PlayState* play) {
+    BossGanon2Scope scope = BossGanon2_EnterSlot(play, ((BossGanon2*)thisx)->hiveSlot);
+
+    BossGanon2_Update_Slotted(thisx, play);
+    BossGanon2_LeaveSlot(play, scope);
+}
+
+void BossGanon2_Draw(Actor* thisx, PlayState* play) {
+    BossGanon2Scope scope = BossGanon2_EnterSlot(play, ((BossGanon2*)thisx)->hiveSlot);
+
+    BossGanon2_Draw_Slotted(thisx, play);
+    BossGanon2_LeaveSlot(play, scope);
+}
+
+// A HiveShock beast takes a free slot. With none free he is removed before being initialised (hiveSlot -1 tells
+// Destroy to skip).
+void BossGanon2_Init(Actor* thisx, PlayState* play) {
+    BossGanon2* this = (BossGanon2*)thisx;
+    s32 slot = sCurSlot;
+    BossGanon2Scope scope;
+
+    if (gHiveShockBossSpawn != 0) {
+        slot = BossGanon2_AllocHiveSlot();
+        if (slot < 0) {
+            this->hiveSlot = -1;
+            Actor_Kill(thisx);
+            return;
+        }
+    }
+    this->hiveSlot = slot;
+
+    scope = BossGanon2_EnterSlot(play, slot);
+    BossGanon2_Init_Slotted(thisx, play);
+    BossGanon2_LeaveSlot(play, scope);
+}
+
+void BossGanon2_Destroy(Actor* thisx, PlayState* play) {
+    BossGanon2* this = (BossGanon2*)thisx;
+    BossGanon2Scope scope;
+
+    if (this->hiveSlot < 0) {
+        return;
+    }
+
+    scope = BossGanon2_EnterSlot(play, this->hiveSlot);
+    BossGanon2_Destroy_Slotted(thisx, play);
+    if (this->hiveSlot > 0) {
+        sSlots[this->hiveSlot].inUse = 0;
+    }
+    BossGanon2_LeaveSlot(play, scope);
+}
+
 void BossGanon2_InitRand(s32 seedInit0, s32 seedInit1, s32 seedInit2) {
     sBossGanon2Seed1 = seedInit0;
     sBossGanon2Seed2 = seedInit1;
@@ -108,6 +266,11 @@ void BossGanon2_SetObjectSegment(BossGanon2* this, PlayState* play, s32 objectId
     s32 pad;
     s32 objectIdx = Object_GetIndex(&play->objectCtx, objectId);
 
+    if (objectIdx < 0) {
+        // HiveShock can spawn Ganon in a scene that never loaded these objects. Assets resolve by name, so any slot
+        // is fine for the segment.
+        objectIdx = 0;
+    }
     gSegments[6] = PHYSICAL_TO_VIRTUAL(play->objectCtx.status[objectIdx].segment);
 
     if (setRSPSegment) {
@@ -158,15 +321,17 @@ void func_808FD27C(PlayState* play, Vec3f* position, Vec3f* velocity, f32 scale)
 
 static u8 hasFoundMasterSword;
 
-void BossGanon2_Init(Actor* thisx, PlayState* play) {
+void BossGanon2_Init_Slotted(Actor* thisx, PlayState* play) {
     BossGanon2* this = (BossGanon2*)thisx;
     s32 pad;
     s16 i;
 
-    play->specialEffects = sBossGanon2Particles;
+    if (!gHiveShockBossSpawn) {
+        play->specialEffects = sBossGanon2Particles;
+    } // a HiveShock beast was already pointed at his slot's pool when he entered it
 
     for (i = 0; i < ARRAY_COUNT(sBossGanon2Particles); i++) {
-        sBossGanon2Particles[i].type = 0;
+        ((BossGanon2Effect*)play->specialEffects)[i].type = 0;
     }
 
     this->actor.colChkInfo.mass = MASS_IMMOVABLE;
@@ -186,9 +351,27 @@ void BossGanon2_Init(Actor* thisx, PlayState* play) {
         !CHECK_OWNED_EQUIP(EQUIP_TYPE_SWORD, EQUIP_INV_SWORD_MASTER)) {
         hasFoundMasterSword = 0;
     }
+
+    if (gHiveShockBossSpawn) {
+        // Straight into the fight as the beast, no cutscenes: the same states the story fight reaches once the
+        // transformation ends.
+        this->hiveShock = true;
+        this->actor.world.pos = this->actor.home.pos; // func_808FD5C4 above buried him at y = -3000
+        SkelAnime_Free(&this->skelAnime, play);
+        BossGanon2_SetObjectSegment(this, play, OBJECT_GANON2, false);
+        SkelAnime_InitFlex(play, &this->skelAnime, &gGanonSkel, NULL, NULL, NULL, 0);
+        this->unk_337 = 1;
+        this->unk_335 = 1;
+        this->actor.gravity = -1.0f;
+        this->actor.shape.yOffset = 0.0f;
+        func_808FFDB0(this, play);
+        this->unk_336 = 0;
+        this->unk_1A2[1] = 50;
+        this->actor.flags |= ACTOR_FLAG_ATTENTION_ENABLED;
+    }
 }
 
-void BossGanon2_Destroy(Actor* thisx, PlayState* play) {
+void BossGanon2_Destroy_Slotted(Actor* thisx, PlayState* play) {
     BossGanon2* this = (BossGanon2*)thisx;
 
     SkelAnime_Free(&this->skelAnime, play);
@@ -1087,6 +1270,10 @@ void func_808FFDB0(BossGanon2* this, PlayState* play) {
     s32 sp28;
     s32 objectIdx = Object_GetIndex(&play->objectCtx, OBJECT_GANON2);
 
+    if (objectIdx < 0) {
+        objectIdx = 0; // HiveShock: object not loaded, assets resolve by name
+    }
+
     if (Object_IsLoaded(&play->objectCtx, objectIdx)) {
         gSegments[6] = PHYSICAL_TO_VIRTUAL(play->objectCtx.status[objectIdx].segment);
         Animation_MorphToLoop(&this->skelAnime, &gGanonGuardIdleAnim, -10.0f);
@@ -1216,7 +1403,10 @@ void func_80900344(BossGanon2* this, PlayState* play) {
         Audio_PlayActorSound2(&this->actor, NA_SE_EN_MGANON_UNARI);
     }
 
-    Math_ApproachF(&this->unk_324, 255.0f, 1.0f, 10.0f);
+    if (!this->hiveShock) {
+        // The ring of fire closes the tower's arena; there is no arena here.
+        Math_ApproachF(&this->unk_324, 255.0f, 1.0f, 10.0f);
+    }
 
     if (this->unk_338 != 0) {
         if (Animation_OnFrame(&this->skelAnime, 13.0f)) {
@@ -1312,6 +1502,13 @@ void func_80900650(BossGanon2* this, PlayState* play) {
 }
 
 void func_80900818(BossGanon2* this, PlayState* play) {
+    if (this->hiveShock) {
+        // The story cutscene that restores him: here he just turns to the furious phase.
+        this->unk_334 = 1;
+        func_80900210(this, play);
+        return;
+    }
+
     Animation_MorphToPlayOnce(&this->skelAnime, &gGanonDownedStartAnim, -5.0f);
     this->unk_194 = Animation_GetLastFrame(&gGanonDownedStartAnim);
     this->actionFunc = func_80900890;
@@ -1475,6 +1672,15 @@ void func_80900890(BossGanon2* this, PlayState* play) {
 }
 
 void func_80901020(BossGanon2* this, PlayState* play) {
+    if (this->hiveShock) {
+        // No death cutscene: he blows up where he stands.
+        play->envCtx.unk_D8 = 0.0f;
+        play->envCtx.unk_BE = 0;
+        play->envCtx.customSkyboxFilter = 0;
+        HiveShock_BossExplode(play, &this->actor, true);
+        return;
+    }
+
     Animation_MorphToPlayOnce(&this->skelAnime, &gGanonDownedStartAnim, -5.0f);
     this->unk_194 = Animation_GetLastFrame(&gGanonDownedStartAnim);
     this->actionFunc = func_8090120C;
@@ -1906,7 +2112,9 @@ void func_80902348(BossGanon2* this, PlayState* play) {
                 }
 
                 func_8002F6D4(play, &this->actor, 15.0f, this->actor.yawTowardsPlayer + phi_v0_2, 2.0f, 0);
-                sBossGanon2Zelda->unk_3C8 = 8;
+                if (sBossGanon2Zelda != NULL) {
+                    sBossGanon2Zelda->unk_3C8 = 8;
+                }
                 this->unk_316 = 10;
                 break;
             }
@@ -1925,7 +2133,9 @@ void func_80902348(BossGanon2* this, PlayState* play) {
 
             player->bodyIsBurning = true;
             func_8002F6D4(play, &this->actor, 10.0f, Math_Atan2S(temp_f12, temp_f2), 0.0f, 0x10);
-            sBossGanon2Zelda->unk_3C8 = 8;
+            if (sBossGanon2Zelda != NULL) {
+                    sBossGanon2Zelda->unk_3C8 = 8;
+                }
         }
     }
 }
@@ -2009,7 +2219,7 @@ void func_80902524(BossGanon2* this, PlayState* play) {
     }
 }
 
-void BossGanon2_Update(Actor* thisx, PlayState* play) {
+void BossGanon2_Update_Slotted(Actor* thisx, PlayState* play) {
     BossGanon2* this = (BossGanon2*)thisx;
     s32 pad;
     s16 i;
@@ -2798,7 +3008,7 @@ void func_80905674(BossGanon2* this, PlayState* play) {
     }
 }
 
-void BossGanon2_Draw(Actor* thisx, PlayState* play) {
+void BossGanon2_Draw_Slotted(Actor* thisx, PlayState* play) {
     void* shadowTexture = Graph_Alloc(play->state.gfxCtx, 4096);
     BossGanon2* this = (BossGanon2*)thisx;
     s16 i;
@@ -3155,4 +3365,6 @@ void BossGanon2_Reset(void) {
     memset(D_809105D8, 0, sizeof(D_809105D8));
     memset(D_80910608, 0, sizeof(D_80910608));
     memset(sBossGanon2Particles, 0, sizeof(sBossGanon2Particles));
+    memset(sSlots, 0, sizeof(sSlots));
+    sCurSlot = 0;
 }
